@@ -83,9 +83,8 @@ resources in the cloud.
   ;; Normally you'd have some hot standby continuously running this loop. The `next-start` may not yet
   ;; be available, so if it stays the same, delay for a big to see if a new one arrives.
   (loop [start-t 0]
-    (let [next-start (cloning/restore-segment! dbname target-conn db-store mapper start-t {})
-          last-t     7]
-      (when (<= next-start last-t)
+    (let [next-start (cloning/restore-segment! dbname target-conn db-store mapper start-t {})]
+      (when (< start-t next-start)
         (recur next-start)))))
 
 (comment
@@ -125,6 +124,18 @@ Notes:
 The Redis mapper is only needed, as you can see, on the restore side. The store needs to
 be visible on both sides. Thus, an S3 bucket with proper permissions is the perfect way
 to share the streaming data across regions/zones.
+
+== NOTES
+
+* The :db/id of entities in the new database will *not* match the :db/id of the old entities in the old
+database. Refs will be fixed with respect to this, but if you store *external* data (e.g. s3 data indexed
+by :db/id) then those things will need to be remapped as well (which the IDMapper can help with).
+* So far this library is *very* lightly tested (soon to be remedied).
+* You cannot *write* transactions to the target database during a restore and expect the restore to be able
+to continue. The restore tries to include the reified transactions to maintain any auditing data
+you may have added to the database. As such it is also restoring the original tx time, which
+it cannot do if you transact something that has a time close to "now".
+* Using an elision predicate on the restore can cause transactions to become empty. Those transactions will be skipped.
 
 == License
 
