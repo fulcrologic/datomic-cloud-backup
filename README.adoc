@@ -1,0 +1,145 @@
+= Datomic Cloud Backup and Restore
+:author: Tony Kay
+:lang: en
+:encoding: UTF-8
+:source-highlighter: coderay
+:source-language: clojure
+
+ifdef::env-github[]
+:tip-caption: :bulb:
+:note-caption: :information_source:
+:important-caption: :heavy_exclamation_mark:
+:caution-caption: :fire:
+:warning-caption: :warning:
+endif::[]
+
+ifdef::env-github[]
+toc::[]
+endif::[]
+
+
+image:https://img.shields.io/clojars/v/com.fulcrologic/datomic-cloud-backup.svg[link=https://clojars.org/com.fulcrologic/datomic-cloud-backup]
+
+This small library allows you to incrementally save the transaction log of a Datomic
+cloud database (may also work with on-prem, though there is an official story there).
+Datomic Cloud (at the time of this writing) only has a way to pull data into dev-local,
+but no way to actually store a proper incremental backup for business continuity reasons.
+
+== Usage
+
+This library supports creating a clone of a Datomic database by reading the transaction log and
+saving that to a durable storage (incrementally). Restoration of the database involves playing back
+this transaction log into a new database. The one major complication is that the new database *will* assign
+different IDs to the new entities as they are transacted, thus, we must keep track of what these new IDs are
+in the new database so we can remap them in later incremental steps.
+
+Thus, there is a need for two kinds of durable storage (they have different characteristics, so they
+are represented as two protocols):
+
+* `BackupStore` - A place to store the actual transactions
+* `IDMapper` - A fast durable K/V store that can track ID mappings in the new database over (a potentially long) time.
+
+This library comes with a sample `BackupStore` based on AWS s3, and an `IDMapper` that uses Redis (via carmine).
+
+If you want to use these, then you MUST add the following two libraries to your dependencies (they are
+not included as transitive dependencies in case you want to use something else):
+
+* `com.datomic/dev-local`         - if you want to play with it in dev mode
+* `com.taoensso/carmine`          - if you want to use the RedisIDMapper
+* `com.amazonaws/aws-java-sdk-s3` - if you want to use the S3BackupStore
+* `com.taoensso/nippy`            - for S3BackupStore
+
+You will then need to add this library to your application that you are deploying to the cloud,
+and run, on a periodic basis, an incremental backup.
+
+Here's a very naive implementation that would allow you to clone an entire database using
+resources in the cloud.
+
+[source]
+-----
+(ns com.fulcrologic.datomic-cloud-backup.cloning-test
+  (:require
+    [datomic.client.api :as d]
+    [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
+    [com.fulcrologic.datomic-cloud-backup.cloning :as cloning]
+    [com.fulcrologic.datomic-cloud-backup.ram-stores :refer [new-ram-store new-ram-mapper]]
+    [com.fulcrologic.datomic-cloud-backup.s3-backup-store :refer [new-s3-store aws-credentials?]]
+    [com.fulcrologic.datomic-cloud-backup.redis-id-mapper :refer [new-redis-mapper available? clear-mappings!]]
+    [fulcro-spec.core :refer [specification behavior component assertions =>]])
+  (:import (java.util UUID)))
+
+(defonce client (d/client {:server-type :dev-local
+                           :storage-dir :mem
+                           :system      "test"}))
+
+(defn backup! [dbname source-connection target-store]
+  ;; Normally, you'd not write this as a tight loop, but would instead monitor if it is returning
+  ;; positive numbers and pause when it isn't, as an infinite loop to keep streaming.
+  (loop [n (cloning/backup-next-segment! dbname source-connection target-store 2)]
+    (when (pos? n)
+      (recur (cloning/backup-next-segment! dbname source-connection target-store 2)))))
+
+(defn restore! [dbname target-conn db-store mapper]
+  ;; Normally you'd have some hot standby continuously running this loop. The `next-start` may not yet
+  ;; be available, so if it stays the same, delay for a big to see if a new one arrives.
+  (loop [start-t 0]
+    (let [next-start (cloning/restore-segment! dbname target-conn db-store mapper start-t {})
+          last-t     7]
+      (when (<= next-start last-t)
+        (recur next-start)))))
+
+(comment
+  ;; Clone a db using RAM resources. Probably runs out of memory for anything
+  ;; but small dbs.
+  (let [c (d/connect client {:db-name "some-database"})
+        target-c (d/connect client {:db-name "restored"})
+        store (new-ram-store)
+        mapper (new-ram-mapper)]
+    (backup! :some-database c store)
+    (restore! :some-database target-c store mapper))
+
+  ;; Same thing, but uses S3 resources and Redis. Should handle any db size as
+  ;; long as Redis has space for all of the ID mappings
+  (let [c (d/connect client {:db-name "some-database"})
+        target-c (d/connect client {:db-name "restored"})
+        store (new-s3-store "my-s3-bucket")
+        mapper (new-redis-mapper {:spec {:host "localhost"}})]
+    (backup! :some-database c store)
+    (restore! :some-database target-c store mapper)))
+-----
+
+The Redis connection options are as described in the https://github.com/ptaoussanis/carmine[Carmine docs].
+
+Notes:
+
+* The call to `backup-next-segment!` figures out where to start automatically. You tell
+  it how many transactions you want it to try to do (it stops if there are no more) and
+  it returns how many were done. Thus, if it returns 0 (or less than you asked) then
+  it is at or very near the end. If you sleep for some amount of time and try again,
+  then you'll be doing a hot streaming replication of your database.
+* The call to `restore-segment!` returns the next segment start time that it needs
+  in order to continue. If you call it with a `start-t` that does not yet exist, then
+  it will return that same `start-t`. Thus, you could sleep for some time and try again.
+  Doing so in an infinite loop results in streaming restoration of your database.
+
+The Redis mapper is only needed, as you can see, on the restore side. The store needs to
+be visible on both sides. Thus, an S3 bucket with proper permissions is the perfect way
+to share the streaming data across regions/zones.
+
+== License
+
+The MIT License (MIT)
+Copyright (c) 2017-2019, Fulcrologic, LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
