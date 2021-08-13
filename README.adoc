@@ -81,7 +81,7 @@ resources in the cloud.
 
 (defn restore! [dbname target-conn db-store mapper]
   ;; Normally you'd have some hot standby continuously running this loop. The `next-start` may not yet
-  ;; be available, so if it stays the same, delay for a big to see if a new one arrives.
+  ;; be available, so if it stays the same, delay for a bit to see if a new one arrives.
   (loop [start-t 0]
     (let [next-start (cloning/restore-segment! dbname target-conn db-store mapper start-t {})]
       (when (< start-t next-start)
