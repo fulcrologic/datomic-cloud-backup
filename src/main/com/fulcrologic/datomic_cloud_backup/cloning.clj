@@ -162,9 +162,9 @@
                             data)
             {:keys [tempids
                     error]} (try
+                              (log/infof "Restoring %s transaction t = %d." source-database-name t)
                               (d/transact conn {:tx-data data
                                                 :timeout 10000000})
-                              (log/infof "Restored %s transaction t = %d." source-database-name t)
                               (catch Exception e
                                 (log/error e "Restore transaction failed!")
                                 {:error e}))
