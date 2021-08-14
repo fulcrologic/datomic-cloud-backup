@@ -5,9 +5,12 @@
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
     [com.fulcrologic.datomic-cloud-backup.cloning :as cloning]
     [com.fulcrologic.datomic-cloud-backup.s3-backup-store :refer [new-s3-store aws-credentials?]]
+    [com.fulcrologic.datomic-cloud-backup.filesystem-backup-store :refer [new-filesystem-store]]
     [com.fulcrologic.datomic-cloud-backup.redis-id-mapper :refer [new-redis-mapper available? clear-mappings!]]
     [fulcro-spec.core :refer [specification behavior component assertions =>]])
-  (:import (java.util UUID)))
+  (:import (java.util UUID)
+           (java.nio.file Files)
+           (java.nio.file.attribute FileAttribute)))
 
 (defonce client (d/client {:server-type :dev-local
                            :storage-dir :mem
@@ -29,45 +32,84 @@
   (let [source-db-name (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
         person-id      (UUID/randomUUID)
+        address-id     (UUID/randomUUID)
         txns           [[{:db/ident       :person/id
                           :db/valueType   :db.type/uuid
                           :db/unique      :db.unique/identity
                           :db/cardinality :db.cardinality/one}
                          {:db/ident       :person/name
                           :db/valueType   :db.type/string
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident       :address/id
+                          :db/valueType   :db.type/uuid
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident       :address/street
+                          :db/valueType   :db.type/string
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident       :person/address
+                          :db/valueType   :db.type/ref
                           :db/cardinality :db.cardinality/one}]
-                        [{:person/id   person-id
-                          :person/name "Bob"}]]
+                        [{:db/id          "BOB"
+                          :person/id      person-id
+                          :person/name    "Bob"
+                          :person/address {:db/id          "MAIN"
+                                           :address/id     address-id
+                                           :address/street "123 Main"}}]]
         _              (d/create-database client {:db-name source-db-name})
         _              (d/create-database client {:db-name target-db-name})
         conn           (d/connect client {:db-name source-db-name})
         target-conn    (d/connect client {:db-name target-db-name})
-        _              (doseq [txn txns]
-                         (d/transact conn {:tx-data txn}))]
+        {{:strs [BOB MAIN]} :tempids} (last (mapv (fn [txn] (d/transact conn {:tx-data txn})) txns))
+        ;; This is here to make sure IDs don't align
+        _              (d/transact target-conn {:tx-data [{:db/ident       :thing/id
+                                                           :db/valueType   :db.type/long
+                                                           :db/unique      :db.unique/identity
+                                                           :db/cardinality :db.cardinality/one}
+                                                          {:db/ident       :other/id
+                                                           :db/valueType   :db.type/long
+                                                           :db/unique      :db.unique/identity
+                                                           :db/cardinality :db.cardinality/one}
+                                                          [:db/add "datomic.tx" :db/txInstant #inst "2020-01-01"]]})]
 
     (component "incremental backup"
       (backup! dbname conn db-store)
 
       (assertions
         "Can back up the database in pieces"
-        (dcbp/saved-segment-info db-store dbname) => [{:start-t 1 :end-t 2}
-                                                      {:start-t 3 :end-t 4}
-                                                      {:start-t 5 :end-t 6}
-                                                      {:start-t 7 :end-t 7}]))
+        (mapv
+          #(select-keys % #{:start-t :end-t})
+          (dcbp/saved-segment-info db-store dbname)) => [{:start-t 1 :end-t 2}
+                                                         {:start-t 3 :end-t 4}
+                                                         {:start-t 5 :end-t 6}
+                                                         {:start-t 7 :end-t 7}]))
 
     (component "incremental restore"
       (restore! dbname target-conn db-store mapper)
 
-      (let [restored-db (d/db target-conn)
-            person      (d/pull restored-db [:person/id :person/name] [:person/id person-id])]
+      (let [restored-db    (d/db target-conn)
+            person         (d/pull restored-db [:db/id :person/id :person/name
+                                                {:person/address [:address/id :address/street]}]
+                             [:person/id person-id])
+            new-bob-id     (dcbp/resolve-id mapper dbname BOB)
+            new-address-id (dcbp/resolve-id mapper dbname MAIN)]
         (assertions
+          "Resolves the new IDs"
+          (int? new-bob-id) => true
+          (int? new-address-id) => true
+          (not= BOB new-bob-id) => true
+          (not= MAIN new-address-id) => true
           "Can restore the database in pieces"
-          person => {:person/id   person-id
-                     :person/name "Bob"})))))
+          (dissoc person :db/id) => {:person/id      person-id
+                                     :person/name    "Bob"
+                                     :person/address {:address/id     address-id
+                                                      :address/street "123 Main"}})))))
 
 (specification "Backup"
   (component "Using Test Stores (RAM-Based)"
-      (run-tests :db1 (new-ram-store) (new-ram-mapper)))
+    (run-tests :db1 (new-ram-store) (new-ram-mapper)))
+  (component "Using Filesystem/RAM mapper"
+    (let [tempdir (.getAbsolutePath (.toFile (Files/createTempDirectory "" (make-array FileAttribute 0))))]
+      (run-tests :db1 (new-filesystem-store tempdir) (new-ram-mapper))))
   (component "Using AWS/Redis"
     (if (and (aws-credentials?) (available? {}))
       (let [dbname (keyword (gensym "test"))]
