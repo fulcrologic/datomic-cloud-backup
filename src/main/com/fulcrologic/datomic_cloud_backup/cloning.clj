@@ -101,7 +101,7 @@
   Returns a sequence of `{:start-t a :end-t b}` of the segment created (where both numbers are inclusive of actual data
   written).
   "
-  [connection dbname store txns-per-segment]
+  [dbname connection store txns-per-segment]
   (let [db       (d/db connection)
         segments (inc (int (/ (:t db) txns-per-segment)))]
     (doall

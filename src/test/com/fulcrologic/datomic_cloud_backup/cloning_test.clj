@@ -151,7 +151,7 @@
       (dotimes [n 1061]
         (d/transact conn {:tx-data [(make-person)]}))
 
-      (let [segments       (cloning/parallel-backup! conn db-name fs-store 100)
+      (let [segments       (cloning/parallel-backup! db-name conn fs-store 100)
             last-stored-t  (-> segments last :end-t)
             {final-data :data
              final-t    :t} (last (d/tx-range conn {:start 1061 :limit -1}))

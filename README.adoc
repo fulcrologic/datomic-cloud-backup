@@ -41,6 +41,8 @@ are represented as two protocols):
 
 This library comes with a sample `BackupStore` based on AWS s3, and an `IDMapper` that uses Redis (via carmine).
 
+=== Extra Dependencies May Be Required
+
 If you want to use these, then you MUST add the following two libraries to your dependencies (they are
 not included as transitive dependencies in case you want to use something else):
 
@@ -51,6 +53,8 @@ not included as transitive dependencies in case you want to use something else):
 
 You will then need to add this library to your application that you are deploying to the cloud,
 and run, on a periodic basis, an incremental backup.
+
+=== Sample Backup Strategy
 
 Here's a very naive implementation that would allow you to clone an entire database using
 resources in the cloud.
@@ -124,6 +128,29 @@ Notes:
 The Redis mapper is only needed, as you can see, on the restore side. The store needs to
 be visible on both sides. Thus, an S3 bucket with proper permissions is the perfect way
 to share the streaming data across regions/zones.
+
+=== Low-level Backups
+
+The naive implementation above uses the store itself to find the next place to resume the
+backup.
+
+The base utility function `backup-segment!` is a little more general-purpose. It allows you
+to explicitly specify the transaction range to back up. This would allow you to track
+your progress in an alternate fashion, or build more complex approaches to backing up
+large amounts of data.
+
+One such approach is documented in the next section.
+
+=== Parallel Backups
+
+There is a function that is useful when you want to run an initial backup on a large database called
+`parallel-backup!`. It runs a complete backup of the database using `pmap` to provide concurrency
+that will adjust to the hardware on hand.
+
+My preliminary tests using a t3-medium instances with an s3 store in an alternate region while backing up
+1000 transactions per s3 object can back up about 40k transactions per minute using the parallel backup
+utility. This speed, of course, could vary dramatically based on your average datom size, and might change
+speed as the I/O subsystems scale out.
 
 == NOTES
 
