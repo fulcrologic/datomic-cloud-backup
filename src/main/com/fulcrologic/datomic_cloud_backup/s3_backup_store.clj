@@ -18,16 +18,19 @@
 (defn- ^AmazonS3 new-s3-client
   "Creates an s3 client. S3 clients are cacheable as long as credentials have not changed. The connection itself is created
   per request. Assumes you have credentials set in your environment according to AWS documentation."
-  []
-  (let [client-config (doto (ClientConfiguration.)
-                        ;; the only kind of errors that are retried are those that aws itself responds with as retryable.
-                        ;; This setting is intended to make it so that s3 operations retry until they succeed (as long
-                        ;; as they *can* succeed. See docstring and https://docs.aws.amazon.com/general/latest/gr/api-retries.html
-                        ;; The default is only 3 retries.
-                        (.setMaxErrorRetry 30))
-        builder       (doto (AmazonS3ClientBuilder/standard)
-                        (.setClientConfiguration client-config))]
-    (.build builder)))
+  ([] (new-s3-client {}))
+  ([{:keys [region]}]
+   (let [client-config (doto (ClientConfiguration.)
+                         ;; the only kind of errors that are retried are those that aws itself responds with as retryable.
+                         ;; This setting is intended to make it so that s3 operations retry until they succeed (as long
+                         ;; as they *can* succeed. See docstring and https://docs.aws.amazon.com/general/latest/gr/api-retries.html
+                         ;; The default is only 3 retries.
+                         (.setMaxErrorRetry 30))
+         builder       (doto (AmazonS3ClientBuilder/standard)
+                         (.setClientConfiguration client-config))]
+     (when region
+       (.setRegion builder region))
+     (.build builder))))
 
 (defn- metadata-with [{:keys [disposition content-type content-length]}]
   (let [object-meta (new ObjectMetadata)]
@@ -108,10 +111,10 @@
   (saved-segment-info [_ dbname]
     (let [stored-segments (list-objects aws-client bucket-name (str "/" (name dbname)))
           infos           (keep (fn [nm]
-                                 (let [[_ start end] (re-find #"^/(\d+)/(\d+)/.*$" nm)]
-                                   (when (and start end)
-                                     {:start-t (Long/parseLong start)
-                                     :end-t   (Long/parseLong end)})))
+                                  (let [[_ start end] (re-find #"^/(\d+)/(\d+)/.*$" nm)]
+                                    (when (and start end)
+                                      {:start-t (Long/parseLong start)
+                                       :end-t   (Long/parseLong end)})))
                             stored-segments)]
       (vec (sort-by :start-t infos))))
   (save-transactions! [_ dbname transaction-group]
@@ -126,5 +129,8 @@
           full-name (str (artifact-basename dbname start-t) nm)]
       (get-compressed-edn aws-client bucket-name full-name))))
 
-(defn new-s3-store [bucket]
-  (->S3BackupStore (new-s3-client) bucket))
+(defn new-s3-store
+  ([bucket s3-options]
+   (->S3BackupStore (new-s3-client s3-options) bucket))
+  ([bucket]
+   (new-s3-store bucket {})))

@@ -104,12 +104,13 @@
   [connection dbname store txns-per-segment]
   (let [db       (d/db connection)
         segments (inc (int (/ (:t db) txns-per-segment)))]
-    (pmap
-      (fn [segment-number]
-        (let [start (* segment-number txns-per-segment)
-              end   (+ start txns-per-segment)]
-          (backup-segment! dbname connection store start end)))
-      (range segments))))
+    (doall
+      (pmap
+        (fn [segment-number]
+          (let [start (* segment-number txns-per-segment)
+                end   (+ start txns-per-segment)]
+            (backup-segment! dbname connection store start end)))
+        (range segments)))))
 
 (defn normalize-txn [{:keys [id->attr rewrite blacklist]} txn]
   (update txn :data (fn [datoms]
