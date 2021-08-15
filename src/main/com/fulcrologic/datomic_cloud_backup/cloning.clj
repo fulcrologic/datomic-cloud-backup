@@ -40,27 +40,19 @@
   [datoms]
   (mapv datom->map datoms))
 
-(defn backup-next-segment!
-  "
-  Computes the next transaction range that is missing from `backup-store` and writes up to
-  `max-txns` to the store.
+(defn backup-segment!
+  "Takes an explicit transaction range, and copies it from the database to
+   the `backup-store`.  `end-t` is exclusive.
 
-  Returns the number of transactions written (if that is `max-txns`, then
-  there may be more transaction that need backing up)."
-  [database-name source-conn backup-store max-txns]
+   Returns the real {:start-t a :end-t b} that was actually stored, which may be nil
+   if nothing was stored."
+  [database-name source-conn backup-store start-t end-t]
   (let [db                 (d/db source-conn)
-        max-t              (:t db)
         ref-attrs          (all-refs db)
         ident-lookup-map   (build-ident-lookup db)
         database-info      {:ident-lookup-map ident-lookup-map
                             :ref-attrs        ref-attrs}
-        {:keys [end-t]
-         :or   {end-t 0}} (last (dcbp/saved-segment-info backup-store database-name))
-        start-t            (inc end-t)
-        last-t             (+ start-t max-txns)
-        tx-group           (if (<= start-t max-t)
-                             (d/tx-range source-conn {:start start-t :end last-t :limit -1})
-                             [])
+        tx-group           (d/tx-range source-conn {:start start-t :end end-t :limit -1})
         serializable-group (mapv #(update % :data mapify-datoms) tx-group)
         actual-start       (-> (vec tx-group) first :t)
         actual-end         (-> tx-group last :t)]
@@ -72,8 +64,52 @@
            :start-t      actual-start
            :end-t        actual-end})
         (log/infof "Backed up transactions for %s t %d through %d (inclusive)." database-name actual-start actual-end)
-        (inc (- actual-end actual-start)))
+        {:start-t actual-start :end-t actual-end})
+      {})))
+
+(defn backup-next-segment!
+  "
+  Computes the next transaction range that is missing from `backup-store` and writes up to
+  `max-txns` to the store.
+
+  Returns the number of transactions written (if that is `max-txns`, then
+  there may be more transaction that need backing up). This call has to analyze the names of all segments, and
+  therefore should not be called too frequently if that is expensive on your backup-store.
+
+  See also `backup-segment!` if you want to implement your own segmentation strategy."
+  [database-name source-conn backup-store max-txns]
+  (let [{:keys [end-t]
+         :or   {end-t 0}} (last (dcbp/saved-segment-info backup-store database-name))
+        start-t (inc end-t)
+        last-t  (+ start-t max-txns)
+        {:keys [start-t end-t]} (backup-segment! database-name source-conn backup-store start-t last-t)]
+    (if (and start-t end-t)
+      (do
+        (log/infof "Backed up transactions for %s t %d through %d (inclusive)." database-name start-t end-t)
+        (inc (- end-t start-t)))
       0)))
+
+(defn parallel-backup!
+  "Creates parallel threads to back up a range of the given database using the storage name `dbname` to
+   the given `store`. This uses `pmap` for the threading.
+
+  * `start-t` is where you want the backup to start
+  * `store` is the backup store to write to (existing segments will be overwritten if they cover and exact same range).
+  * `txns-per-segment` is the max number of transactions you want to put into each backup segment. The final segment
+    will probably have fewer.
+
+  Returns a sequence of `{:start-t a :end-t b}` of the segment created (where both numbers are inclusive of actual data
+  written).
+  "
+  [connection dbname store txns-per-segment]
+  (let [db       (d/db connection)
+        segments (inc (int (/ (:t db) txns-per-segment)))]
+    (pmap
+      (fn [segment-number]
+        (let [start (* segment-number txns-per-segment)
+              end   (+ start txns-per-segment)]
+          (backup-segment! dbname connection store start end)))
+      (range segments))))
 
 (defn normalize-txn [{:keys [id->attr rewrite blacklist]} txn]
   (update txn :data (fn [datoms]
