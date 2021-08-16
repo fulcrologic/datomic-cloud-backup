@@ -17,10 +17,12 @@
 (defn- get-compressed-edn
   "Get a nippy-compressed object from s3 and decompress it back to EDN."
   [^File base-directory ^String name]
-  (let [baos (ByteArrayOutputStream.)
-        _    (io/copy (File. base-directory name) baos)
-        edn  (nippy/thaw (.toByteArray baos))]
-    edn))
+  (let [source-file (File. base-directory name)]
+    (when (.exists source-file)
+      (let [baos (ByteArrayOutputStream.)
+            _    (io/copy source-file baos)
+            edn  (nippy/thaw (.toByteArray baos))]
+        edn))))
 
 (defn- list-objects
   "List all of the objects in the given directory that match pattern"
@@ -47,6 +49,9 @@
   (saved-segment-info [_ dbname]
     (let [stored-segments (list-objects base-directory (backup-file-pattern dbname))]
       (vec (sort-by :start-t stored-segments))))
+  (last-segment-info [this dbname]
+    (select-keys (last (dcbp/saved-segment-info this dbname))
+      #{:start-t :end-t}))
   (save-transactions! [_ dbname transaction-group]
     (let [{:keys [start-t end-t]} transaction-group
           nm (artifact-name dbname start-t end-t)]
@@ -57,10 +62,16 @@
                      (:start-t (first segments))
                      start-t)
           {:keys [filename]} (first (filter #(= start-t (:start-t %)) segments))]
+      (get-compressed-edn base-directory filename)))
+  (load-transaction-group
+    [_ dbname start-t end-t]
+    (let [filename (artifact-name dbname start-t end-t)]
       (get-compressed-edn base-directory filename))))
 
 (defn new-filesystem-store [^String directory]
   (let [d (File. directory)]
+    (when (not (.exists d))
+      (.mkdir d))
     (when (or
             (not (.isDirectory d))
             (not (.canWrite d)))

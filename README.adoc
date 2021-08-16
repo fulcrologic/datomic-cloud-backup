@@ -25,6 +25,11 @@ cloud database (may also work with on-prem, though there is an official story th
 Datomic Cloud (at the time of this writing) only has a way to pull data into dev-local,
 but no way to actually store a proper incremental backup for business continuity reasons.
 
+== Status
+
+This library is under development, and is not yet ready for production use. It is released in the hopes that others
+will find it useful, and perhaps contribute improvements to the ideas.
+
 == Usage
 
 This library supports creating a clone of a Datomic database by reading the transaction log and

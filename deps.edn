@@ -7,4 +7,6 @@
                                  com.taoensso/nippy            {:mvn/version "3.1.1"}
                                  com.amazonaws/aws-java-sdk-s3 {:mvn/version "1.11.826"}}}
              :test {:extra-paths ["src/test"]
-                    :extra-deps  {fulcrologic/fulcro-spec {:mvn/version "3.1.11"}}}}}
+                    :main-opts ["-m" "kaocha.runner"]
+                    :extra-deps  {fulcrologic/fulcro-spec {:mvn/version "3.1.11"}
+                                  lambdaisland/kaocha     {:mvn/version "1.0.732"}}}}}

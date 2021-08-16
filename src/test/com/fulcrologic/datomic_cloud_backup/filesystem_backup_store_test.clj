@@ -34,5 +34,7 @@
           {:start-t 3
            :end-t   6
            :filename "db.3-6.nippy"}]
+      "Can find the last saved segment"
+      (dcbp/last-segment-info store :db) => {:start-t 3 :end-t 6}
       "Can retrieve a segment by its start-t"
       (dcbp/load-transaction-group store :db 3) => group2)))

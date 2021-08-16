@@ -4,6 +4,8 @@
 
 (deftype RAMDBStore [storage]
   dcbp/BackupStore
+  (last-segment-info [this dbname]
+    (last (dcbp/saved-segment-info this dbname)))
   (saved-segment-info [_ dbname]
     (into []
       (map (fn [k]
@@ -18,7 +20,12 @@
     (let [real-start (if (= start-t 0)
                        (reduce min 100 (keys (get @storage dbname)))
                        start-t)]
-      (get-in @storage [dbname real-start]))))
+      (get-in @storage [dbname real-start])))
+  (load-transaction-group
+    [_ dbname start-t end-t]
+    (let [segment (get-in @storage [dbname start-t])]
+      (when (= end-t (:end-t segment))
+        segment))))
 
 (defn new-ram-store []
   (->RAMDBStore (atom {})))

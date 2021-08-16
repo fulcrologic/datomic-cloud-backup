@@ -105,9 +105,16 @@
 
 (defn- artifact-basename [dbname start-t] (format "/%s/%d/" (name dbname) start-t))
 (defn- artifact-name [dbname start-t end-t] (format "/%s/%d/%d/transaction-group.nippy" (name dbname) start-t end-t))
+(defn- last-saved-segment-name [dbname] (format "/%s/last-segment.nippy" (name dbname)))
 
 (deftype S3BackupStore [^AmazonS3 aws-client ^String bucket-name]
   dcbp/BackupStore
+  (last-segment-info [this dbname]
+    (let [object-name (last-saved-segment-name dbname)
+          data        (get-compressed-edn aws-client bucket-name object-name)]
+      (if data
+        data
+        (last (dcbp/saved-segment-info this dbname)))))
   (saved-segment-info [_ dbname]
     (let [stored-segments (list-objects aws-client bucket-name (str "/" (name dbname)))
           infos           (keep (fn [nm]
@@ -120,13 +127,19 @@
   (save-transactions! [_ dbname transaction-group]
     (let [{:keys [start-t end-t]} transaction-group
           nm (artifact-name dbname start-t end-t)]
-      (put-compressed-edn aws-client bucket-name nm transaction-group)))
-  (load-transaction-group [this dbname start-t]
+      (put-compressed-edn aws-client bucket-name nm transaction-group)
+      (put-compressed-edn aws-client bucket-name (last-saved-segment-name dbname) {:start-t start-t :end-t end-t})))
+  (load-transaction-group
+    [this dbname start-t]
     (let [start-t   (if (= 0 start-t)
                       (:start-t (first (dcbp/saved-segment-info this dbname)))
                       start-t)
           nm        (first (list-objects aws-client bucket-name (artifact-basename dbname start-t)))
           full-name (str (artifact-basename dbname start-t) nm)]
+      (get-compressed-edn aws-client bucket-name full-name)))
+  (load-transaction-group
+    [_ dbname start-t end-t]
+    (let [full-name (artifact-name dbname start-t end-t)]
       (get-compressed-edn aws-client bucket-name full-name))))
 
 (defn new-s3-store

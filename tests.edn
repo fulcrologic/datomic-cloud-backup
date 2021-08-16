@@ -1,0 +1,7 @@
+#kaocha/v1
+    {:tests    [{:id           :unit
+                 :ns-patterns  ["-test$"]
+                 :test-paths   ["src/test"]
+                 :source-paths ["src/main"]}]
+;     :reporter [fulcro-spec.reporters.terminal/fulcro-report]
+     :plugins  []}
