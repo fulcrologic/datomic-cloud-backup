@@ -1,4 +1,17 @@
 (ns com.fulcrologic.datomic-cloud-backup.s3-backup-store
+  "AWS implementation of a BackupStore on S3.
+
+   NOTES:
+
+   * Since s3 is eventually consistent it is possible that any reported data from
+   methods like `last-segment-info` are incorrect. This should be ok in most cases because backing up
+   a segment is an idempotent operation.
+   * S3 bills by request.
+   ** Choosing a small number of transactions per segment leads to more PUT requests.
+   ** The `last-segment-info` is the cheapest way to figure out where to resume, since
+   it is a single request. Using `saved-segment-info` lists all objects in the store, and can result
+   in a lot of requests and network overhead.
+   "
   (:require
     [clojure.java.io :as io]
     [clojure.string :as str]

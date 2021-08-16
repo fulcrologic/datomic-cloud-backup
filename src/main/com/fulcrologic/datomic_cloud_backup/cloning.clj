@@ -79,7 +79,7 @@
   See also `backup-segment!` if you want to implement your own segmentation strategy."
   [database-name source-conn backup-store max-txns]
   (let [{:keys [end-t]
-         :or   {end-t 0}} (last (dcbp/saved-segment-info backup-store database-name))
+         :or   {end-t 0}} (dcbp/last-segment-info backup-store database-name)
         start-t (inc end-t)
         last-t  (+ start-t max-txns)
         {:keys [start-t end-t]} (backup-segment! database-name source-conn backup-store start-t last-t)]
@@ -89,11 +89,62 @@
         (inc (- end-t start-t)))
       0)))
 
-(defn parallel-backup!
-  "Creates parallel threads to back up a range of the given database using the storage name `dbname` to
+(defn backup!
+  "Run a backup.
+
+  * dbname - What to call this backup in the store. Does not have to match the actual database name on the connection
+  * connection - The connection of the database to back up
+  * store - The BackupStore to write to
+  * options:
+    * :txns-per-segment - The number of transactions to try to put in each segment of the backup. Defaults to 10,000
+    * :starting-segment - The starting segment of the backup (default 0). Use this to continue a previous backup. The starting-segment
+      times the txns-per-segment determines the transaction on which the backup will start. Defaults to 0.
+    * :parallel? - Default true. Run segment backups in parallel. WARNING: This can stress the DynamoDB layer. The backup
+      utility will retry on capacity exceptions, but beware that your application could also receive capacity exceptions.
+
+  This function retries if there is any kind of transitional failure on any segment. A persistent failure can cause
+  the backup to terminate early with an exception.
+  "
+  [dbname connection store {:keys [txns-per-segment
+                                   starting-segment
+                                   parallel?]
+                            :or   {txns-per-segment 10000
+                                   starting-segment 0
+                                   parallel?        true}}]
+  (let [db       (d/db connection)
+        Map      (if parallel? pmap map)
+        segments (inc (int (/ (:t db) txns-per-segment)))]
+    (doall
+      (Map
+        (fn [segment-number]
+          (let [start (* segment-number txns-per-segment)
+                end   (+ start txns-per-segment)]
+            (loop [attempt 0]
+              (let [ok?    (atom false)
+                    result (atom nil)]
+                (try
+                  (reset! result (backup-segment! dbname connection store start end))
+                  (reset! ok? true)
+                  (catch Exception e
+                    (log/warn e "Backup step failed. Retrying" attempt)))
+                (cond
+                  (> attempt 10) (do
+                                   (log/error "BACKUP FAILED. Too many attempts on segment" segment-number [start end])
+                                   (throw (ex-info "BACKUP FAILED." {:segment-number segment-number
+                                                                     :start-t        start
+                                                                     :end-t          end})))
+                  (not @ok?) (do
+                               (Thread/sleep 1000)
+                               (recur (inc attempt)))
+                  :else @result)))))
+        (range starting-segment segments)))))
+
+(defn ^:deprecated parallel-backup!
+  "DEPRECATED. Use backup! instead.
+
+  Creates parallel threads to back up a range of the given database using the storage name `dbname` to
    the given `store`. This uses `pmap` for the threading.
 
-  * `start-t` is where you want the backup to start
   * `store` is the backup store to write to (existing segments will be overwritten if they cover and exact same range).
   * `txns-per-segment` is the max number of transactions you want to put into each backup segment. The final segment
     will probably have fewer.
@@ -102,15 +153,9 @@
   written).
   "
   [dbname connection store txns-per-segment]
-  (let [db       (d/db connection)
-        segments (inc (int (/ (:t db) txns-per-segment)))]
-    (doall
-      (pmap
-        (fn [segment-number]
-          (let [start (* segment-number txns-per-segment)
-                end   (+ start txns-per-segment)]
-            (backup-segment! dbname connection store start end)))
-        (range segments)))))
+  (backup! dbname connection store {:txns-per-segment txns-per-segment
+                                    :parallel?        true
+                                    :starting-offset  0}))
 
 (defn normalize-txn [{:keys [id->attr rewrite blacklist]} txn]
   (update txn :data (fn [datoms]
