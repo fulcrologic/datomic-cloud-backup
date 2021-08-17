@@ -260,3 +260,47 @@
         (when error
           (throw error))))
     (inc end-t)))
+
+(defn backup-gaps
+  "Looks for gaps in the given segments (maps of :start-t and :end-t inclusive, which is what the db store's
+   `saved-segment-info` returns).
+
+   Returns a possibly empty sequece of maps containing the :start-t (inclusive) and :end-t (exclusive) of any gaps that
+   are found in the segment list. These are what can be passed to `backup-segment!` to fill that gap."
+  [all-segments]
+  (let [all-segments (sort-by :start-t all-segments)]
+    (persistent!
+      (:gaps
+        (reduce
+          (fn [{:keys [last-end-t] :as acc} {:keys [start-t end-t] :as segment}]
+            (cond
+              (and last-end-t (< start-t last-end-t)) (do
+                                                        (log/warn "Segment" segment "overlaps another segment.")
+                                                        acc)
+              (and last-end-t (not= start-t (inc last-end-t)))
+              (-> acc
+                (assoc :last-end-t end-t)
+                (update :gaps conj! {:start-t (inc last-end-t)
+                                     :end-t   start-t}))
+              :ese (assoc acc :last-end-t end-t)))
+          {:gaps (transient [])}
+          all-segments)))))
+
+(defn repair-backup!
+  "Looks for problems with the backup of `dbname` in `db-store` and repairs them. This means it:
+
+   * Finds gaps in the backup segments and runs backups of them.
+
+   WARNING: repairing large gaps can cause a lot of I/O on the database. You may want to check the gaps
+   using `backup-gaps` before running this blindly.
+   "
+  [dbname conn db-store]
+  (let [saved-segments (dcbp/saved-segment-info db-store dbname)
+        gaps           (backup-gaps (or saved-segments []))]
+    (if (empty? gaps)
+      (log/info "There were no gaps in the backup")
+      (doseq [{:keys [start-t end-t] :as gap} gaps]
+        (log/infof "Found gap %s. Backing it up." gap)
+        (backup-segment! dbname conn db-store start-t end-t)))))
+
+

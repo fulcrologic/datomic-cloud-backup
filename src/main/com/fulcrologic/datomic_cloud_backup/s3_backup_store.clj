@@ -45,6 +45,8 @@
        (.setRegion builder region))
      (.build builder))))
 
+(defn- aws-object-exists? [aws-client bucket nm] (.doesObjectExist aws-client bucket nm))
+
 (defn- metadata-with [{:keys [disposition content-type content-length]}]
   (let [object-meta (new ObjectMetadata)]
     (when disposition (.setContentDisposition object-meta disposition))
@@ -124,7 +126,8 @@
   dcbp/BackupStore
   (last-segment-info [this dbname]
     (let [object-name (last-saved-segment-name dbname)
-          data        (get-compressed-edn aws-client bucket-name object-name)]
+          data        (when (aws-object-exists? aws-client bucket-name object-name)
+                        (get-compressed-edn aws-client bucket-name object-name))]
       (if data
         data
         (last (dcbp/saved-segment-info this dbname)))))

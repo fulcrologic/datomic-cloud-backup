@@ -34,6 +34,13 @@
       (when (<= next-start last-t)
         (recur next-start)))))
 
+(defn clean-filesystem! [^File tmpdir]
+  (when (and (.exists tmpdir) (.isDirectory tmpdir) (str/starts-with? (.getAbsolutePath tmpdir) "/t"))
+    (doseq [backup-file (filter
+                          (fn [^File nm] (str/ends-with? (.getName nm) ".nippy"))
+                          (file-seq tmpdir))]
+      (.delete backup-file))))
+
 (defn run-tests [dbname db-store mapper]
   (let [source-db-name (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
@@ -118,8 +125,10 @@
   (component "Using Test Stores (RAM-Based)"
     (run-tests :db1 (new-ram-store) (new-ram-mapper)))
   (component "Using Filesystem/RAM mapper"
-    (let [tempdir (.getAbsolutePath (.toFile (Files/createTempDirectory "" (make-array FileAttribute 0))))]
-      (run-tests :db1 (new-filesystem-store tempdir) (new-ram-mapper))))
+    (let [tmpdirfile (.toFile (Files/createTempDirectory "" (make-array FileAttribute 0)))
+          tempdir    (.getAbsolutePath tmpdirfile)]
+      (run-tests :db1 (new-filesystem-store tempdir) (new-ram-mapper))
+      (clean-filesystem! tmpdirfile)))
   (component "Using AWS/Redis"
     (if (and (aws-credentials?) (available? {}))
       (let [dbname (keyword (gensym "test"))]
@@ -164,14 +173,74 @@
           last-stored-t => final-t))
 
       (finally
-        (doseq [backup-file (filter
-                              (fn [^File nm] (str/ends-with? (.getName nm) ".nippy"))
-                              (file-seq tmpdir))]
-          (.delete backup-file))
-        (.delete tmpdir)
+        (clean-filesystem! tmpdir)
         (d/delete-database client {:db-name db-name})))))
 
+(specification "backup-gaps"
+  (assertions
+    "Returns a sequence of gaps that are found in the provided database segments"
+    (cloning/backup-gaps [{:start-t 100
+                           :end-t   105}
+                          {:start-t 110
+                           :end-t   118}
+                          #_{:start-t 109
+                             :end-t   130}
+                          #_{:start-t 109
+                             :end-t   145}
+                          {:start-t 146
+                           :end-t   163}])
+    => [{:start-t 106 :end-t 110}
+        {:start-t 119 :end-t 146}]))
 
+(specification "repair-backup!" :focus
+  (let [db-name        (keyword (gensym "db"))
+        target-db-name (keyword (gensym "db"))
+        schema         [{:db/ident       :person/id
+                         :db/valueType   :db.type/long
+                         :db/unique      :db.unique/identity
+                         :db/cardinality :db.cardinality/one}
+                        {:db/ident       :person/name
+                         :db/valueType   :db.type/string
+                         :db/cardinality :db.cardinality/one}]
+        tempdirfile    (.toFile (Files/createTempDirectory "" (make-array FileAttribute 0)))
+        tempdir        (.getAbsolutePath tempdirfile)
+        store          (new-filesystem-store tempdir)
+        _              (d/create-database client {:db-name db-name})
+        conn           (d/connect client {:db-name db-name})
+        _              (d/transact conn {:tx-data schema})]
 
+    (try
+      (dotimes [n 1000]
+        (d/transact conn {:tx-data [{:person/id   n
+                                     :person/name "Bob"}]}))
 
+      (cloning/backup-segment! db-name conn store 1 300)
+      (cloning/backup-segment! db-name conn store 330 565)
+      (cloning/backup-segment! db-name conn store 575 1000)
+      (cloning/backup-segment! db-name conn store 1000 1100)
 
+      (assertions
+        "When there is a gap in the backup"
+        (count (cloning/backup-gaps (dcbp/saved-segment-info store db-name))) => 2)
+
+      (cloning/repair-backup! db-name conn store)
+
+      (assertions
+        "Creates the missing file(s)"
+        (count (cloning/backup-gaps (dcbp/saved-segment-info store db-name))) => 0)
+
+      (let [mapper      (new-ram-mapper)
+            _           (d/create-database client {:db-name target-db-name})
+            target-conn (d/connect client {:db-name target-db-name})]
+        (doseq [{:keys [start-t] :as segment} (dcbp/saved-segment-info store db-name)]
+          (cloning/restore-segment! db-name target-conn store mapper start-t {}))
+        (let [db  (d/db target-conn)
+              cnt (ffirst (d/q '[:find (count ?p) :where [?p :person/name]] db))]
+          (assertions
+            "The repaired backup contains all of the original entities"
+            cnt => 1000)))
+
+      (finally
+        (clean-filesystem! tempdirfile)
+        (d/delete-database client {:db-name target-db-name})
+        (d/delete-database client {:db-name db-name})))))
