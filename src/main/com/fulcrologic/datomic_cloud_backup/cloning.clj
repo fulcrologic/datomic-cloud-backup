@@ -192,6 +192,11 @@
                 (< (compare tm #inst "1980-01-01") 0)))))))
     txns))
 
+(defn -load-transactions
+  "Protocols don't mock well. This is just a wrapper to facilitate a testing scenario."
+  [backup-store dbname start-t]
+  (dcbp/load-transaction-group backup-store dbname start-t))
+
 (defn restore-segment!
   "Restore a segment of a backup.
 
@@ -209,11 +214,16 @@
   There is a global atom in this ns called `abort-import?` which this function sets to false. If you set it to true it
   will cause this restore to terminate early.
 
+  WARNING: You should avoid calling this function when you are rebooting/restarting the machine. There is
+  a small time window between running a transaction and saving the tempid remappings that, if interrupted,
+  will lose the mapping, which in turn can corrupt your recovery. Ideally you would have something like
+  a Redis flag that you could toggle in order to pause your restore so you can safely redeploy.
+
   Returns the next `start-t` that is needed to continue restoration.
   "
   [source-database-name conn backup-store id-mapper start-t {:keys [blacklist rewrite]
                                                              :or   {blacklist #{}}}]
-  (let [{:keys [end-t info transactions] :as tgi} (dcbp/load-transaction-group backup-store source-database-name start-t)
+  (let [{:keys [end-t info transactions] :as tgi} (-load-transactions backup-store source-database-name start-t)
         {ref?              :ref-attrs
          attr->original-id :ident-lookup-map} info
         target-attr->id          (build-ident-lookup (d/db conn))
@@ -251,11 +261,9 @@
                                 (let [{:db/keys [error]} (ex-data e)]
                                   (if (= error :db.error/past-tx-instant)
                                     (do
-                                      (log/warn "Resuming backup. Transaction already processed. Skipping" source-database-name t)
+                                      (log/warn "Transaction was already processed. Skipping" source-database-name t)
                                       {:tempids {}})
-                                    {:error e}))
-                                (log/error e "Restore transaction failed!" source-database-name t)
-                                {:error e})
+                                    {:error e})))
                               (catch Exception e
                                 (log/error e "Restore transaction failed!" source-database-name t)
                                 {:error e}))

@@ -7,7 +7,7 @@
     [com.fulcrologic.datomic-cloud-backup.s3-backup-store :refer [new-s3-store aws-credentials?]]
     [com.fulcrologic.datomic-cloud-backup.filesystem-backup-store :refer [new-filesystem-store]]
     [com.fulcrologic.datomic-cloud-backup.redis-id-mapper :refer [new-redis-mapper available? clear-mappings!]]
-    [fulcro-spec.core :refer [specification behavior component assertions =>]]
+    [fulcro-spec.core :refer [specification behavior component assertions => provided]]
     [com.fulcrologic.datomic-cloud-backup.filesystem-backup-store :as fs]
     [clojure.java.shell :as sh]
     [clojure.string :as str]
@@ -192,7 +192,7 @@
     => [{:start-t 106 :end-t 110}
         {:start-t 119 :end-t 146}]))
 
-(specification "repair-backup!" :focus
+(specification "repair-backup!"
   (let [db-name        (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
         schema         [{:db/ident       :person/id
@@ -242,5 +242,64 @@
 
       (finally
         (clean-filesystem! tempdirfile)
+        (d/delete-database client {:db-name target-db-name})
+        (d/delete-database client {:db-name db-name})))))
+
+(specification "Resuming an Interrupted Restore" :focus
+  (let [db-name        (keyword (gensym "db"))
+        target-db-name (keyword (gensym "db"))
+        schema         [{:db/ident       :person/id
+                         :db/valueType   :db.type/long
+                         :db/unique      :db.unique/identity
+                         :db/cardinality :db.cardinality/one}
+                        {:db/ident       :person/name
+                         :db/valueType   :db.type/string
+                         :db/cardinality :db.cardinality/one}]
+        store          (new-ram-store)
+        _              (d/create-database client {:db-name db-name})
+        conn           (d/connect client {:db-name db-name})
+        _              (d/transact conn {:tx-data schema})]
+
+    (try
+      (dotimes [n 101]
+        (Thread/sleep 1)                                    ; important. if too fast then tx time doesn't change and we get a false success on test
+        (d/transact conn {:tx-data [{:person/id   n
+                                     :person/name "Bob"}]}))
+
+      (cloning/backup-segment! db-name conn store 1 10)
+      (cloning/backup-segment! db-name conn store 10 20)
+      (cloning/backup-segment! db-name conn store 20 (:t (d/db conn)))
+
+      (let [mapper      (new-ram-mapper)
+            _           (d/create-database client {:db-name target-db-name})
+            target-conn (d/connect client {:db-name target-db-name})]
+
+        (assertions
+          "Restore returns the next start-t that should be used"
+          (cloning/restore-segment! db-name target-conn store mapper 1 {}) => 10)
+
+        (let [group          (dcbp/load-transaction-group store db-name 10)
+              real-load-txns cloning/-load-transactions]
+          (provided "The restore restores only PART of a segment"
+            ;; The first time we simulate a failure midway through restore
+            (cloning/-load-transactions s n start) =1x=> (update group :transactions subvec 0 5)
+            ;; The rest of the time we do what we are asked
+            (cloning/-load-transactions s n start) => (real-load-txns s n start)
+
+            ;; First attempt on this segment only gets half of them
+            (cloning/restore-segment! db-name target-conn store mapper 10 {})
+            ;; Retry should get the rest, an complain about the duplicates
+            (cloning/restore-segment! db-name target-conn store mapper 10 {})
+            ;; Load the remainder of the database
+            (cloning/restore-segment! db-name target-conn store mapper 20 {})
+
+            (assertions
+              "Resuming succeeds"
+              (ffirst
+                (d/q '[:find (count ?id)
+                       :where
+                       [?id :person/id]] (d/db target-conn))) => 100))))
+
+      (finally
         (d/delete-database client {:db-name target-db-name})
         (d/delete-database client {:db-name db-name})))))
