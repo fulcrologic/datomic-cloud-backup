@@ -244,11 +244,10 @@
                             data)
             {:keys [tempids
                     error]} (try
-                              (log/infof "Restoring %s transaction t = %d." source-database-name t)
                               (d/transact conn {:tx-data data
                                                 :timeout 10000000})
                               (catch Exception e
-                                (log/error e "Restore transaction failed!")
+                                (log/error e "Restore transaction failed!" source-database-name t)
                                 {:error e}))
             addl-rewrites (reduce-kv (fn [acc tempid realid]
                                        (if (= tempid "datomic.tx")
