@@ -5,7 +5,8 @@
     [clojure.set :as set]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
     [datomic.client.api :as d]
-    [taoensso.timbre :as log]))
+    [taoensso.timbre :as log])
+  (:import (clojure.lang ExceptionInfo)))
 
 (def abort-import? (atom false))
 
@@ -246,6 +247,15 @@
                     error]} (try
                               (d/transact conn {:tx-data data
                                                 :timeout 10000000})
+                              (catch ExceptionInfo e
+                                (let [{:db/keys [error]} (ex-data e)]
+                                  (if (= error :db.error/past-tx-instant)
+                                    (do
+                                      (log/warn "Resuming backup. Transaction already processed. Skipping" source-database-name t)
+                                      {:tempids {}})
+                                    {:error e}))
+                                (log/error e "Restore transaction failed!" source-database-name t)
+                                {:error e})
                               (catch Exception e
                                 (log/error e "Restore transaction failed!" source-database-name t)
                                 {:error e}))
