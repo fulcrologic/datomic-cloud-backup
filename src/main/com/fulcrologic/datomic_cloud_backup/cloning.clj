@@ -158,29 +158,37 @@
                                     :parallel?        true
                                     :starting-offset  0}))
 
-(defn normalize-txn [{:keys [id->attr rewrite blacklist]} txn]
+(defn normalize-txn [{:keys [id->attr to-one? rewrite blacklist]} txn]
   (update txn :data (fn [datoms]
                       (->> datoms
-                        (sort-by first)
-                        (map
-                          (fn [{:keys [e a v added]}]
-                            (let [a (id->attr a)
-                                  e (if (= a :db/txInstant) "datomic.tx" e)
-                                  v (if-let [rewrite (and added (get rewrite a))]
-                                      (rewrite a v)
-                                      v)]
-                              [(if added :db/add :db/retract) e a v])))
+                        (sort-by (comp not :added))
+                        (reduce
+                          (fn [{:keys [adds result] :as acc} {:keys [e a v added]}]
+                            (let [a        (id->attr a)
+                                  e        (if (= a :db/txInstant) "datomic.tx" e)
+                                  v        (if-let [rewrite (and added (get rewrite a))]
+                                             (rewrite a v)
+                                             v)
+                                  retract? (not added)
+                                  noop?    (and retract? (contains? adds a) to-one? (to-one? a))]
+                              ;; This is necessary because rewrite can cause the add/retract to match, which will cause
+                              ;; a datom conflict.
+                              (if noop?
+                                acc
+                                (-> acc
+                                  (update :adds conj a)
+                                  (update :result conj [(if added :db/add :db/retract) e a v])))))
+                          {:adds #{} :result []})
+                        :result
                         (remove #(contains? blacklist (nth % 2)))))))
 
 (defn tx-time [{:keys [data]}]
   (last (first (filter #(= :db/txInstant (nth % 2)) data))))
 
-(defn normalize-txns [{:keys [id->attr blacklist rewrite]} txns]
+(defn normalize-txns [{:keys [id->attr to-one? blacklist rewrite] :as env} txns]
   (into []
     (comp
-      (map (partial normalize-txn {:id->attr  id->attr
-                                   :rewrite   rewrite
-                                   :blacklist blacklist}))
+      (map (partial normalize-txn env))
       ;; NOTE: The drop is here to skip the stuff that is auto-created by Datomic itself during create-database.
       ;; It is my best guess, and *seems* to work, but could break with different versions.
       (drop-while
@@ -196,6 +204,22 @@
   "Protocols don't mock well. This is just a wrapper to facilitate a testing scenario."
   [backup-store dbname start-t]
   (dcbp/load-transaction-group backup-store dbname start-t))
+
+(defn- to-many? [db attr]
+  (try
+    (= :db.cardinality/many
+      (ffirst
+        (d/q
+          '[:find ?c
+            :in $ ?attr
+            :where
+            [?attr :db/cardinality ?card]
+            [?card :db/ident ?c]]
+          db attr)))
+    (catch Exception _
+      true)))
+
+(defn- to-one? [db attr] (not (to-many? db attr)))
 
 (defn restore-segment!
   "Restore a segment of a backup.
@@ -233,6 +257,7 @@
                                            (when-let [target-id (get target-attr->id attr)]
                                              [id target-id]))) attr->original-id)
         transactions-of-interest (normalize-txns {:id->attr  id->attr
+                                                  :to-one?   (partial to-one? (d/db conn))
                                                   :blacklist blacklist
                                                   :rewrite   rewrite} transactions)
         resolve                  (fn [id] (or (dcbp/resolve-id id-mapper source-database-name id) (str id)))]
@@ -263,9 +288,17 @@
                                     (do
                                       (log/warn "Transaction was already processed. Skipping" source-database-name t)
                                       {:tempids {}})
-                                    {:error e})))
+                                    (do
+                                      (log/error e "Restore transaction failed!"
+                                        {:db         source-database-name
+                                         :t          t
+                                         :tx-content data})
+                                      {:error e}))))
                               (catch Exception e
-                                (log/error e "Restore transaction failed!" source-database-name t)
+                                (log/error e "Restore transaction failed!"
+                                  {:db         source-database-name
+                                   :t          t
+                                   :tx-content data})
                                 {:error e}))
             addl-rewrites (reduce-kv (fn [acc tempid realid]
                                        (if (= tempid "datomic.tx")
