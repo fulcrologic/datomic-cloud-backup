@@ -28,10 +28,3 @@
       `(inc end-t)` of the prior one. Transaction groups can vary in size, so do not assume you can guess this value.
       See `last-segment-info` for an optimal way to know what the last segment is, and `save-segment-info` to get a list of them all."))
 
-(defprotocol IDMapper
-  "A durable map-like storage for ID mappings. This is used to keep track of what ID is used in
-   a new database (during restore) so that references to if from the old database can be corrected."
-  (store-id-mappings! [this dbname source-id->target-id]
-    "Accumulate the given mappings (from source ID to target ID, all longs) into the ID Mapper")
-  (resolve-id [this dbname source-id]
-    "Returns the target-id that is associated with the given source-id in the mapper"))

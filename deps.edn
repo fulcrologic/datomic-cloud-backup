@@ -1,12 +1,13 @@
 {:paths     ["src/main"]
- :deps      {org.clojure/clojure {:mvn/version "1.10.3"}
-             com.taoensso/timbre {:mvn/version "5.0.0"}}
+ :deps      {org.clojure/clojure        {:mvn/version "1.10.3"}
+             com.fulcrologic/guardrails {:mvn/version "1.1.5"}
+             com.taoensso/timbre        {:mvn/version "5.0.0"}}
  :mvn/repos {"cognitect-dev-tools" {:url "https://dev-tools.cognitect.com/maven/releases/"}}
  :aliases   {:dev  {:extra-deps {com.datomic/dev-local         {:mvn/version "0.9.235"}
                                  com.taoensso/carmine          {:mvn/version "3.0.1"}
                                  com.taoensso/nippy            {:mvn/version "3.1.1"}
                                  com.amazonaws/aws-java-sdk-s3 {:mvn/version "1.11.826"}}}
              :test {:extra-paths ["src/test"]
-                    :main-opts ["-m" "kaocha.runner"]
+                    :main-opts   ["-m" "kaocha.runner"]
                     :extra-deps  {fulcrologic/fulcro-spec {:mvn/version "3.1.11"}
                                   lambdaisland/kaocha     {:mvn/version "1.0.732"}}}}}

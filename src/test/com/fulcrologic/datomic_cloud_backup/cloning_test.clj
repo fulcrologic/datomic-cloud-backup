@@ -1,17 +1,14 @@
 (ns com.fulcrologic.datomic-cloud-backup.cloning-test
   (:require
     [datomic.client.api :as d]
-    [com.fulcrologic.datomic-cloud-backup.ram-stores :refer [new-ram-store new-ram-mapper]]
+    [com.fulcrologic.datomic-cloud-backup.ram-stores :refer [new-ram-store]]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
     [com.fulcrologic.datomic-cloud-backup.cloning :as cloning]
     [com.fulcrologic.datomic-cloud-backup.s3-backup-store :refer [new-s3-store aws-credentials?]]
     [com.fulcrologic.datomic-cloud-backup.filesystem-backup-store :refer [new-filesystem-store]]
-    [com.fulcrologic.datomic-cloud-backup.redis-id-mapper :refer [new-redis-mapper available? clear-mappings!]]
     [fulcro-spec.core :refer [specification behavior component assertions => provided]]
     [com.fulcrologic.datomic-cloud-backup.filesystem-backup-store :as fs]
-    [clojure.java.shell :as sh]
     [clojure.string :as str]
-    [clojure.java.io :as io]
     [taoensso.timbre :as log])
   (:import (java.util UUID)
            (java.nio.file Files)
@@ -27,9 +24,9 @@
     (when (pos? n)
       (recur (cloning/backup-next-segment! dbname source-connection target-store 2)))))
 
-(defn restore! [dbname target-conn db-store mapper]
+(defn restore! [dbname target-conn db-store]
   (loop [start-t 0]
-    (let [next-start (cloning/restore-segment! dbname target-conn db-store mapper start-t {})
+    (let [next-start (cloning/restore-segment! dbname target-conn db-store start-t {})
           last-t     7]
       (when (<= next-start last-t)
         (recur next-start)))))
@@ -41,27 +38,30 @@
                           (file-seq tmpdir))]
       (.delete backup-file))))
 
-(defn run-tests [dbname db-store mapper]
+(def sample-schema
+  [{:db/ident       :person/id
+    :db/valueType   :db.type/uuid
+    :db/unique      :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+   {:db/ident       :person/name
+    :db/valueType   :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident       :address/id
+    :db/valueType   :db.type/uuid
+    :db/cardinality :db.cardinality/one}
+   {:db/ident       :address/street
+    :db/valueType   :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident       :person/address
+    :db/valueType   :db.type/ref
+    :db/cardinality :db.cardinality/one}])
+
+(defn run-tests [dbname db-store]
   (let [source-db-name (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
         person-id      (UUID/randomUUID)
         address-id     (UUID/randomUUID)
-        txns           [[{:db/ident       :person/id
-                          :db/valueType   :db.type/uuid
-                          :db/unique      :db.unique/identity
-                          :db/cardinality :db.cardinality/one}
-                         {:db/ident       :person/name
-                          :db/valueType   :db.type/string
-                          :db/cardinality :db.cardinality/one}
-                         {:db/ident       :address/id
-                          :db/valueType   :db.type/uuid
-                          :db/cardinality :db.cardinality/one}
-                         {:db/ident       :address/street
-                          :db/valueType   :db.type/string
-                          :db/cardinality :db.cardinality/one}
-                         {:db/ident       :person/address
-                          :db/valueType   :db.type/ref
-                          :db/cardinality :db.cardinality/one}]
+        txns           [sample-schema
                         [{:db/id          "BOB"
                           :person/id      person-id
                           :person/name    "Bob"
@@ -72,17 +72,22 @@
         _              (d/create-database client {:db-name target-db-name})
         conn           (d/connect client {:db-name source-db-name})
         target-conn    (d/connect client {:db-name target-db-name})
-        {{:strs [BOB MAIN]} :tempids} (last (mapv (fn [txn] (d/transact conn {:tx-data txn})) txns))
-        ;; This is here to make sure IDs don't align
-        _              (d/transact target-conn {:tx-data [{:db/ident       :thing/id
-                                                           :db/valueType   :db.type/long
-                                                           :db/unique      :db.unique/identity
-                                                           :db/cardinality :db.cardinality/one}
-                                                          {:db/ident       :other/id
-                                                           :db/valueType   :db.type/long
-                                                           :db/unique      :db.unique/identity
-                                                           :db/cardinality :db.cardinality/one}
-                                                          [:db/add "datomic.tx" :db/txInstant #inst "2020-01-01"]]})]
+        {{:strs [BOB MAIN]} :tempids} (last (mapv (fn [txn]
+                                                    (Thread/sleep 1)
+                                                    (d/transact conn {:tx-data txn})) txns))]
+    ;; This is here to make sure IDs don't align
+    (d/transact target-conn {:tx-data [{:db/ident       :thing/id
+                                        :db/valueType   :db.type/long
+                                        :db/unique      :db.unique/identity
+                                        :db/cardinality :db.cardinality/one}
+                                       {:db/ident       :other/id
+                                        :db/valueType   :db.type/long
+                                        :db/unique      :db.unique/identity
+                                        :db/cardinality :db.cardinality/one}
+                                       [:db/add "datomic.tx" :db/txInstant #inst "2020-01-01"]]})
+    (d/transact target-conn {:tx-data [{:db/id    "new-thing"
+                                        :thing/id 99}
+                                       [:db/add "datomic.tx" :db/txInstant #inst "2020-01-01T00:00:01"]]})
 
     (try
       (component "incremental backup"
@@ -98,45 +103,239 @@
                                                            {:start-t 7 :end-t 7}]))
 
       (component "incremental restore"
-        (restore! dbname target-conn db-store mapper)
+        (restore! dbname target-conn db-store)
 
-        (let [restored-db    (d/db target-conn)
-              person         (d/pull restored-db [:db/id :person/id :person/name
-                                                  {:person/address [:address/id :address/street]}]
-                               [:person/id person-id])
-              new-bob-id     (dcbp/resolve-id mapper dbname BOB)
-              new-address-id (dcbp/resolve-id mapper dbname MAIN)]
+        (let [restored-db (d/db target-conn)
+              person      (d/pull restored-db [:person/id :person/name
+                                               ::cloning/original-id
+                                               {:person/address [:address/id :address/street
+                                                                 ::cloning/original-id]}]
+                            [:person/id person-id])]
           (assertions
-            "Resolves the new IDs"
-            (int? new-bob-id) => true
-            (int? new-address-id) => true
-            (not= BOB new-bob-id) => true
-            (not= MAIN new-address-id) => true
             "Can restore the database in pieces"
-            (dissoc person :db/id) => {:person/id      person-id
-                                       :person/name    "Bob"
-                                       :person/address {:address/id     address-id
-                                                        :address/street "123 Main"}})))
+            (dissoc person :db/id) => {:person/id            person-id
+                                       ::cloning/original-id BOB
+                                       :person/name          "Bob"
+                                       :person/address       {:address/id           address-id
+                                                              ::cloning/original-id MAIN
+                                                              :address/street       "123 Main"}})))
       (finally
         (d/delete-database client {:db-name source-db-name})
         (d/delete-database client {:db-name target-db-name})))))
 
-(specification "Backup"
-  (component "Using Test Stores (RAM-Based)"
-    (run-tests :db1 (new-ram-store) (new-ram-mapper)))
-  (component "Using Filesystem/RAM mapper"
-    (let [tmpdirfile (.toFile (Files/createTempDirectory "" (make-array FileAttribute 0)))
-          tempdir    (.getAbsolutePath tmpdirfile)]
-      (run-tests :db1 (new-filesystem-store tempdir) (new-ram-mapper))
-      (clean-filesystem! tmpdirfile)))
-  (component "Using AWS/Redis"
-    (if (and (aws-credentials?) (available? {}))
-      (let [dbname (keyword (gensym "test"))]
-        (clear-mappings! {} dbname)
-        (run-tests dbname (new-s3-store "datomic-cloning-test-bucket") (new-redis-mapper {})))
+(specification "Adding tracking schema"
+  (let [db-name (keyword (gensym "db"))
+        _       (d/create-database client {:db-name db-name})
+        conn    (d/connect client {:db-name db-name})]
+
+    (cloning/ensure-restore-schema! conn)
+
+    (let [db (d/db conn)]
       (assertions
-        "Resources not available. Test skipped"
-        true => true))))
+        "Adds the proper starting location"
+        (-> (d/datoms db {:index      :eavt
+                          :components [::cloning/last-source-transaction ::cloning/last-source-transaction]})
+          first
+          :v)
+        => 0))))
+
+(specification "Bookkeeping datoms"
+  (let [db-name        (keyword (gensym "db"))
+        target-db-name (keyword (gensym "db"))
+        _              (d/create-database client {:db-name db-name})
+        _              (d/create-database client {:db-name target-db-name})
+        conn           (d/connect client {:db-name db-name})
+        target-conn    (d/connect client {:db-name target-db-name})
+        person-id      (UUID/randomUUID)
+        person2-id     (UUID/randomUUID)
+        tx!            (fn [c tx] (as-> (d/transact c {:tx-data tx}) $
+                                    (assoc {}
+                                      :data (:tx-data $)
+                                      :tempids (:tempids $)
+                                      :t (dec (:t (d/db c))))))
+        schema-entry   (tx! conn sample-schema)
+        {:keys [tempids] :as tx1-entry} (tx! conn [{:db/id       "PERSON1"
+                                                    :person/id   person-id
+                                                    :person/name "Joe"}])
+        {:strs [PERSON1]} tempids
+        {:keys [tempids] :as tx2-entry} (tx! conn [{:person/id   person-id
+                                                    :person/name "Bob"}
+                                                   {:db/id       "PERSON2"
+                                                    :person/id   person2-id
+                                                    :person/name "Mary"}])
+        {:strs [PERSON2]} tempids]
+    (try
+      (cloning/ensure-restore-schema! target-conn)
+      (tx! target-conn [{:db/ident       :boogers/mcgee
+                         :db/cardinality :db.cardinality/one
+                         :db/valueType   :db.type/string}])
+
+      (let [db     (d/db target-conn)
+            datoms (cloning/bookkeeping-datoms {:db db} schema-entry)
+            {:keys [t]} schema-entry]
+        (assertions
+          "Adds a CAS operation to ensure the entry being restored in the correct one"
+          (first datoms) => [:db/cas ::cloning/last-source-transaction ::cloning/last-source-transaction 0 t]
+          "Adds original IDs to the schema attributes"
+          (every? (fn [[add tmpid k id]]
+                    (and
+                      (= add :db/add)
+                      (string? tmpid)
+                      (= k ::cloning/original-id)
+                      (int? id))) (rest datoms)) => true)
+
+
+        (tx! target-conn sample-schema)
+
+        (let [_      (d/transact target-conn
+                       {:tx-data
+                        [{:db/id                (str PERSON1)
+                          ::cloning/original-id PERSON1
+                          :person/id            person-id
+                          :person/name          "Joe"}]})
+              tx-id  (->> tx2-entry :data (filter (fn [{:keys [v]}] (inst? v))) (map :e) (first))
+              db     (d/db target-conn)
+              datoms (cloning/bookkeeping-datoms {:db db} tx2-entry)]
+          (assertions
+            "Fixes tempids on the tx and new items"
+            (vec (rest datoms)) => [[:db/add "datomic.tx" ::cloning/original-id tx-id]
+                                    [:db/add (str PERSON2) ::cloning/original-id PERSON2]])))
+
+      (finally
+        (d/delete-database client {:db-name db-name})
+        (d/delete-database client {:db-name target-db-name})))))
+
+(specification "resolved-txn"
+  (let [db-name        (keyword (gensym "db"))
+        target-db-name (keyword (gensym "db"))
+        _              (d/create-database client {:db-name db-name})
+        _              (d/create-database client {:db-name target-db-name})
+        conn           (d/connect client {:db-name db-name})
+        target-conn    (d/connect client {:db-name target-db-name})
+        person-id      (UUID/randomUUID)
+        person2-id     (UUID/randomUUID)
+        tx!            (fn [c tx] (as-> (d/transact c {:tx-data tx}) $
+                                    (assoc {}
+                                      :data (:tx-data $)
+                                      :tempids (:tempids $)
+                                      :t (dec (:t (d/db c))))))
+        schema-entry   (tx! conn sample-schema)
+        {:keys [tempids] :as tx1-entry} (tx! conn [{:db/id       "PERSON1"
+                                                    :person/id   person-id
+                                                    :person/name "Joe"}])
+        {:strs [PERSON1]} tempids
+        {:keys [tempids] :as tx2-entry} (tx! conn [{:person/id   person-id
+                                                    :person/name "Bob"}
+                                                   {:db/id       "PERSON2"
+                                                    :person/id   person2-id
+                                                    :person/name "Mary"}])
+        id->attr       (cloning/id->attr (d/as-of (d/db conn) #inst "2000-01-01"))
+        {:strs [PERSON2]} tempids]
+    (try
+      (cloning/ensure-restore-schema! target-conn)
+      (tx! target-conn [{:db/ident       :boogers/mcgee
+                         :db/cardinality :db.cardinality/one
+                         :db/valueType   :db.type/string}])
+
+      (let [db             (d/db target-conn)
+            source-refs    (cloning/all-refs (d/db conn))
+            original-tx-id (-> schema-entry :data first :tx)
+            txn            (cloning/resolved-txn {:db          db
+                                                  :id->attr    id->attr
+                                                  :source-refs source-refs} schema-entry)]
+        (component "When dealing with early schema"
+          (assertions
+            "Adds original IDs to user schema attributes"
+            (subvec txn 1 7) => [[:db/add "74" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 74]
+                                 [:db/add "77" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 77]
+                                 [:db/add "75" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 75]
+                                 [:db/add "datomic.tx" :com.fulcrologic.datomic-cloud-backup.cloning/original-id original-tx-id]
+                                 [:db/add "76" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 76]
+                                 [:db/add "73" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 73]]
+            "Rewrites the db id of the txn to datomic.tx"
+            (second (nth txn 7)) => "datomic.tx"
+            "Rewrites the :db/id of the new items to strings that match the original ids"
+            (subvec txn 8 24) => [[:db/add "73" :db/ident :person/id]
+                                  [:db/add "73" :db/valueType :db.type/uuid]
+                                  [:db/add "73" :db/unique :db.unique/identity]
+                                  [:db/add "73" :db/cardinality :db.cardinality/one]
+                                  [:db/add "74" :db/ident :person/name]
+                                  [:db/add "74" :db/valueType :db.type/string]
+                                  [:db/add "74" :db/cardinality :db.cardinality/one]
+                                  [:db/add "75" :db/ident :address/id]
+                                  [:db/add "75" :db/valueType :db.type/uuid]
+                                  [:db/add "75" :db/cardinality :db.cardinality/one]
+                                  [:db/add "76" :db/ident :address/street]
+                                  [:db/add "76" :db/valueType :db.type/string]
+                                  [:db/add "76" :db/cardinality :db.cardinality/one]
+                                  [:db/add "77" :db/ident :person/address]
+                                  [:db/add "77" :db/valueType :db.type/ref]
+                                  [:db/add "77" :db/cardinality :db.cardinality/one]]
+            "Uses the temp ids as the values for install attribute"
+            (subvec txn 24) => [[:db/add :db.part/db :db.install/attribute "73"]
+                                [:db/add :db.part/db :db.install/attribute "74"]
+                                [:db/add :db.part/db :db.install/attribute "75"]
+                                [:db/add :db.part/db :db.install/attribute "76"]
+                                [:db/add :db.part/db :db.install/attribute "77"]]))
+
+
+        (tx! target-conn sample-schema)
+
+        (let [{{:strs [NEW-PERSON1]} :tempids} (d/transact target-conn
+                                                 {:tx-data
+                                                  [{:db/id                "NEW-PERSON1"
+                                                    ::cloning/original-id PERSON1
+                                                    :person/id            person-id
+                                                    :person/name          "Joe"}]})
+              db             (d/db target-conn)
+              source-refs    (cloning/all-refs (d/db conn))
+              txn            (cloning/resolved-txn {:db          db
+                                                    :id->attr    id->attr
+                                                    :source-refs source-refs} tx2-entry)
+              original-tx-id (-> tx2-entry :data first :tx)]
+          (assertions
+            "Includes the transaction sequence CAS"
+            (ffirst txn) => :db/cas
+            "Adds the original ID to the transaction"
+            (second txn) => [:db/add
+                             "datomic.tx"
+                             :com.fulcrologic.datomic-cloud-backup.cloning/original-id
+                             original-tx-id]
+            "Adds original IDs to new entities"
+            (nth txn 2) => [:db/add
+                            (str PERSON2)
+                            :com.fulcrologic.datomic-cloud-backup.cloning/original-id
+                            PERSON2]
+            "Includes the original transaction time"
+            (-> txn (nth 3) butlast) => [:db/add "datomic.tx" :db/txInstant]
+            "Uses real IDs for updating things that are in the database"
+            ;; NOTE: The strings for attributes are because we are not doing the actual restore,
+            ;; so it cannot find the original IDs
+            (subvec txn 4 6) => [[:db/add NEW-PERSON1 "74" "Bob"]
+                                 [:db/retract NEW-PERSON1 "74" "Joe"]]
+            "Uses correct tmpid for new entities"
+            (map second (subvec txn 6)) => [(str PERSON2) (str PERSON2)])))
+
+      (finally
+        (d/delete-database client {:db-name db-name})
+        (d/delete-database client {:db-name target-db-name})))))
+
+(specification "Backup" :focus
+  (component "Using Test Stores (RAM-Based)"
+    (run-tests :db1 (new-ram-store)))
+  #_#_(component "Using Filesystem/RAM mapper"
+        (let [tmpdirfile (.toFile (Files/createTempDirectory "" (make-array FileAttribute 0)))
+              tempdir    (.getAbsolutePath tmpdirfile)]
+          (run-tests :db1 (new-filesystem-store tempdir))
+          (clean-filesystem! tmpdirfile)))
+      (component "Using AWS/Redis"
+        (if (and (aws-credentials?) (available? {}))
+          (let [dbname (keyword (gensym "test"))]
+            (clear-mappings! {} dbname)
+            (run-tests dbname (new-s3-store "datomic-cloning-test-bucket")))
+          (assertions
+            "Resources not available. Test skipped"
+            true => true))))
 
 (specification "Parallel backup"
   (let [tmpdir      (.toFile (Files/createTempDirectory "test" (make-array FileAttribute 0)))
@@ -160,7 +359,8 @@
       (dotimes [n 1061]
         (d/transact conn {:tx-data [(make-person)]}))
 
-      (let [segments       (cloning/parallel-backup! db-name conn fs-store 100)
+      (let [segments       (cloning/backup! db-name conn fs-store {:parallel?        true
+                                                                   :txns-per-segment 100})
             last-stored-t  (-> segments last :end-t)
             {final-data :data
              final-t    :t} (last (d/tx-range conn {:start 1061 :limit -1}))
@@ -229,13 +429,13 @@
         "Creates the missing file(s)"
         (count (cloning/backup-gaps (dcbp/saved-segment-info store db-name))) => 0)
 
-      (let [mapper      (new-ram-mapper)
-            _           (d/create-database client {:db-name target-db-name})
+      (let [_           (d/create-database client {:db-name target-db-name})
             target-conn (d/connect client {:db-name target-db-name})]
         (doseq [{:keys [start-t] :as segment} (dcbp/saved-segment-info store db-name)]
-          (cloning/restore-segment! db-name target-conn store mapper start-t {}))
+          (cloning/restore-segment! db-name target-conn store start-t {}))
         (let [db  (d/db target-conn)
-              cnt (ffirst (d/q '[:find (count ?p) :where [?p :person/name]] db))]
+              cnt (ffirst (try (d/q '[:find (count ?p) :where [?p :person/name]] db)
+                               (catch Exception e nil)))]
           (assertions
             "The repaired backup contains all of the original entities"
             cnt => 1000)))
@@ -245,7 +445,7 @@
         (d/delete-database client {:db-name target-db-name})
         (d/delete-database client {:db-name db-name})))))
 
-(specification "Resuming an Interrupted Restore" :focus
+(specification "Resuming an Interrupted Restore"
   (let [db-name        (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
         schema         [{:db/ident       :person/id
@@ -264,19 +464,18 @@
       (dotimes [n 101]
         (Thread/sleep 1)                                    ; important. if too fast then tx time doesn't change and we get a false success on test
         (d/transact conn {:tx-data [{:person/id   n
-                                     :person/name "Bob"}]}))
+                                     :person/name (str "Bob " n)}]}))
 
       (cloning/backup-segment! db-name conn store 1 10)
       (cloning/backup-segment! db-name conn store 10 20)
       (cloning/backup-segment! db-name conn store 20 (:t (d/db conn)))
 
-      (let [mapper      (new-ram-mapper)
-            _           (d/create-database client {:db-name target-db-name})
+      (let [_           (d/create-database client {:db-name target-db-name})
             target-conn (d/connect client {:db-name target-db-name})]
 
         (assertions
           "Restore returns the next start-t that should be used"
-          (cloning/restore-segment! db-name target-conn store mapper 1 {}) => 10)
+          (cloning/restore-segment! db-name target-conn store 1 {}) => 10)
 
         (let [group          (dcbp/load-transaction-group store db-name 10)
               real-load-txns cloning/-load-transactions]
@@ -287,11 +486,11 @@
             (cloning/-load-transactions s n start) => (real-load-txns s n start)
 
             ;; First attempt on this segment only gets half of them
-            (cloning/restore-segment! db-name target-conn store mapper 10 {})
+            (cloning/restore-segment! db-name target-conn store 10 {})
             ;; Retry should get the rest, an complain about the duplicates
-            (cloning/restore-segment! db-name target-conn store mapper 10 {})
+            (cloning/restore-segment! db-name target-conn store 10 {})
             ;; Load the remainder of the database
-            (cloning/restore-segment! db-name target-conn store mapper 20 {})
+            (cloning/restore-segment! db-name target-conn store 20 {})
 
             (assertions
               "Resuming succeeds"

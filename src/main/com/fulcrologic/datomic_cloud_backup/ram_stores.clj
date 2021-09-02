@@ -29,13 +29,3 @@
 
 (defn new-ram-store []
   (->RAMDBStore (atom {})))
-
-(deftype RAMIDMapper [storage]
-  dcbp/IDMapper
-  (store-id-mappings! [_ dbname source-id->target-id]
-    (swap! storage update dbname merge source-id->target-id))
-  (resolve-id [_ dbname source-id]
-    (get-in @storage [dbname source-id])))
-
-(defn new-ram-mapper []
-  (->RAMIDMapper (atom {})))

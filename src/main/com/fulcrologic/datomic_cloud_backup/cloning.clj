@@ -1,36 +1,55 @@
 (ns com.fulcrologic.datomic-cloud-backup.cloning
   "Copy a database with history via transaction logs. Based on code from Cognitect."
   (:require
+    [com.fulcrologic.guardrails.core :refer [>defn => ?]]
     [clojure.pprint :refer [pprint]]
     [clojure.set :as set]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
     [datomic.client.api :as d]
-    [taoensso.timbre :as log])
-  (:import (clojure.lang ExceptionInfo)))
+    [datomic.client.api.protocols :as dp]
+    [taoensso.timbre :as log]
+    [taoensso.truss :refer [have]]
+    [clojure.spec.alpha :as s])
+  (:import (clojure.lang ExceptionInfo)
+           (java.util Date)))
 
-(def abort-import? (atom false))
+(s/def ::db #(satisfies? dp/Db %))
+(s/def ::datom #(int? (:e %)))
+(s/def ::t int?)
+(s/def ::data (s/coll-of ::datom))
+(s/def ::txn (s/keys :req-un [::t ::data]))
+(s/def ::connection #(satisfies? dp/Connection %))
+(s/def ::e (s/or :tmp string? :real int? :ident keyword? :special #{:db.part/db}))
+(s/def ::a (s/or :id int? :ident keyword?))
+(s/def ::v any?)
+(s/def ::op #{:db/add :db/retract})
+(s/def ::casop #{:db/cas})
+(s/def ::tx int?)
+(s/def ::added boolean?)
+(s/def ::datom-map (s/keys :req-un [::e ::a ::v ::tx ::added]))
+(s/def ::txn-op (s/or
+                  :cas (s/tuple ::casop ::e ::a ::v ::v)
+                  :add-or-retract (s/tuple ::op ::e ::a ::v)))
+(s/def ::to-one? ifn?)
+(s/def ::id->attr ifn?)
+(s/def ::source-refs (s/coll-of int? :kind set?))
+(s/def ::rewrite (? (s/map-of keyword? fn?)))
+(s/def ::blacklist (? (s/every keyword? :kind set?)))
 
-(defn all-refs
+(>defn all-refs
   "Return a set of all :db.type/ref entity IDs from the provided DB"
   [db]
+  [::db => (s/every int? :kind set?)]
   (into #{}
     (map first
-      (d/q '[:find ?a
+      (d/q '[:find ?e
              :in $
              :where
-             [?e :db/valueType :db.type/ref]
-             [?e :db/ident ?a]] db))))
+             [?e :db/valueType :db.type/ref]] db))))
 
-(defn build-ident-lookup
-  "Creates a map from Datomic ident to eid for the given database."
-  [db]
-  (into {}
-    (d/q '[:find ?ident ?e
-           :in $
-           :where [?e :db/ident ?ident]]
-      db)))
-
-(defn datom->map [{:keys [e a v tx added]}]
+(>defn datom->map
+  [{:keys [e a v tx added]}]
+  [::datom => ::datom-map]
   {:e     e
    :a     a
    :v     v
@@ -41,18 +60,27 @@
   [datoms]
   (mapv datom->map datoms))
 
+(>defn id->attr
+  [db]
+  [::db => (s/map-of int? keyword?)]
+  (into {}
+    (d/q
+      '[:find ?e ?a
+        :where
+        [?e :db/ident ?a]]
+      db)))
+
 (defn backup-segment!
   "Takes an explicit transaction range, and copies it from the database to
    the `backup-store`.  `end-t` is exclusive.
 
    Returns the real {:start-t a :end-t b} that was actually stored, which may be nil
-   if nothing was stored."
+   if nothing was stored.
+
+   "
   [database-name source-conn backup-store start-t end-t]
   (let [db                 (d/db source-conn)
-        ref-attrs          (all-refs db)
-        ident-lookup-map   (build-ident-lookup db)
-        database-info      {:ident-lookup-map ident-lookup-map
-                            :ref-attrs        ref-attrs}
+        ref-attr-ids       (all-refs db)
         tx-group           (d/tx-range source-conn {:start start-t :end end-t :limit -1})
         serializable-group (mapv #(update % :data mapify-datoms) tx-group)
         actual-start       (-> (vec tx-group) first :t)
@@ -60,7 +88,8 @@
     (if (and actual-start actual-end)
       (do
         (dcbp/save-transactions! backup-store database-name
-          {:info         database-info
+          {:refs         ref-attr-ids
+           :id->attr     (id->attr (d/as-of db #inst "2000-01-01"))
            :transactions serializable-group
            :start-t      actual-start
            :end-t        actual-end})
@@ -140,65 +169,39 @@
                   :else @result)))))
         (range starting-segment segments)))))
 
-(defn ^:deprecated parallel-backup!
-  "DEPRECATED. Use backup! instead.
+(>defn normalize-txn
+  [{:keys [to-one? id->attr rewrite blacklist]} transaction]
+  [(s/keys
+     :req-un [::to-one? ::id->attr]
+     :opt-un [::rewrite ::blacklist])
+   (s/coll-of ::txn-op :kind vector?) => (s/coll-of ::txn-op :kind vector?)]
+  (->> transaction
+    (sort-by #(not= :db/add (first %)))
+    (reduce
+      (fn [{:keys [adds] :as acc} [op e a v :as original]]
+        (let [added    (= :db/add op)
+              v        (if-let [rewrite (and added (get rewrite a))]
+                         (rewrite a v)
+                         v)
+              retract? (= :db/retract op)
+              noop?    (and retract? (contains? adds a) to-one? (to-one? a))]
+          ;; This is necessary because rewrite can cause the add/retract to match, which will cause
+          ;; a datom conflict.
+          (cond
+            noop? acc
+            added (-> acc
+                    (update :adds conj a)
+                    (update :result conj [op e a v]))
+            retract? (update acc :result conj [op e a v])
+            :else (update acc :result conj original))))
+      {:adds #{} :result []})
+    :result
+    (remove #(contains? blacklist (nth % 2)))
+    vec))
 
-  Creates parallel threads to back up a range of the given database using the storage name `dbname` to
-   the given `store`. This uses `pmap` for the threading.
-
-  * `store` is the backup store to write to (existing segments will be overwritten if they cover and exact same range).
-  * `txns-per-segment` is the max number of transactions you want to put into each backup segment. The final segment
-    will probably have fewer.
-
-  Returns a sequence of `{:start-t a :end-t b}` of the segment created (where both numbers are inclusive of actual data
-  written).
-  "
-  [dbname connection store txns-per-segment]
-  (backup! dbname connection store {:txns-per-segment txns-per-segment
-                                    :parallel?        true
-                                    :starting-offset  0}))
-
-(defn normalize-txn [{:keys [id->attr to-one? rewrite blacklist]} txn]
-  (update txn :data (fn [datoms]
-                      (->> datoms
-                        (sort-by (comp not :added))
-                        (reduce
-                          (fn [{:keys [adds result] :as acc} {:keys [e a v added]}]
-                            (let [a        (id->attr a)
-                                  e        (if (= a :db/txInstant) "datomic.tx" e)
-                                  v        (if-let [rewrite (and added (get rewrite a))]
-                                             (rewrite a v)
-                                             v)
-                                  retract? (not added)
-                                  noop?    (and retract? (contains? adds a) to-one? (to-one? a))]
-                              ;; This is necessary because rewrite can cause the add/retract to match, which will cause
-                              ;; a datom conflict.
-                              (if noop?
-                                acc
-                                (-> acc
-                                  (update :adds conj a)
-                                  (update :result conj [(if added :db/add :db/retract) e a v])))))
-                          {:adds #{} :result []})
-                        :result
-                        (remove #(contains? blacklist (nth % 2)))))))
-
-(defn tx-time [{:keys [data]}]
+(>defn tx-time [{:keys [data]}]
+  [::txn => (? inst?)]
   (last (first (filter #(= :db/txInstant (nth % 2)) data))))
-
-(defn normalize-txns [{:keys [id->attr to-one? blacklist rewrite] :as env} txns]
-  (into []
-    (comp
-      (map (partial normalize-txn env))
-      ;; NOTE: The drop is here to skip the stuff that is auto-created by Datomic itself during create-database.
-      ;; It is my best guess, and *seems* to work, but could break with different versions.
-      (drop-while
-        (fn [txn]
-          (let [tm (tx-time txn)]
-            (boolean
-              (or
-                (nil? tm)
-                (< (compare tm #inst "1980-01-01") 0)))))))
-    txns))
 
 (defn -load-transactions
   "Protocols don't mock well. This is just a wrapper to facilitate a testing scenario."
@@ -221,67 +224,144 @@
 
 (defn- to-one? [db attr] (not (to-many? db attr)))
 
+(defn tempid-tracking-schema-txns
+  [connection]
+  (let [last-datoms (-> (d/tx-range connection {:start 1 :limit -1})
+                      last
+                      :data)
+        tx-id       (-> last-datoms first :tx)
+        time        (:v (first (filter #(and (= tx-id (:e %)) (inst? (:v %))) last-datoms)))
+        tma         (Date. (long (+ 1000 (inst-ms time))))
+        tmb         (Date. (long (+ 2000 (inst-ms time))))]
+    [[{:db/id        "datomic.tx"
+       :db/txInstant tma}
+      {:db/ident       ::original-id
+       :db/unique      :db.unique/identity
+       :db/cardinality :db.cardinality/one
+       :db/valueType   :db.type/long
+       :db/doc         "Tracks the original :db/id of the entity in the source database."}
+      {:db/ident       ::last-source-transaction
+       :db/noHistory   true
+       :db/cardinality :db.cardinality/one
+       :db/valueType   :db.type/long
+       :db/doc         "The last *source* transaction that was successfully processed against this database."}]
+     [{:db/id        "datomic.tx"
+       :db/txInstant tmb}
+      [:db/add ::last-source-transaction ::last-source-transaction 0]]]))
+
+(>defn ensure-restore-schema!
+  [connection]
+  [::connection => boolean?]
+  (let [db          (d/db connection)
+        has-schema? (boolean
+                      (first
+                        (d/datoms db {:index      :avet
+                                      :components [:db/ident ::original-id]
+                                      :limit      1})))]
+    (when-not has-schema?
+      (log/info "Adding schema to track :db/id remappings.")
+      (doseq [txn (tempid-tracking-schema-txns connection)]
+        (d/transact connection {:tx-data txn})))
+    true))
+
+(>defn resolve-id
+  "Finds the new database's :db/id for the given :db/id, or returns a stringified version of the ID for use as a new
+   tempid."
+  [{:keys [db tx-id id->attr]} old-id]
+  [(s/keys :ref-un [::db ::tx-id ::id->attr]) int? => ::e]
+  (let [old-id (get id->attr old-id old-id)]
+    (cond
+      (= tx-id old-id) "datomic.tx"
+      (keyword? old-id) old-id
+      :else (or
+              (-> (d/datoms db {:index      :avet
+                                :components [::original-id old-id]})
+                first
+                :e)
+              (str old-id)))))
+
+(defn bookkeeping-datoms
+  [{:keys [db] :as env} {:keys [t data]}]
+  [(s/keys :req-un [::db]) ::txn => (s/coll-of ::txn-op :kind vector?)]
+  (let [unique-ids                   (into #{} (map :e) (vec data))
+        current-t                    (ffirst (d/q '[:find ?t :where [::last-source-transaction ::last-source-transaction ?t]] db))
+        tx-id                        (-> data first :tx)
+        env                          (assoc env :tx-id tx-id)
+        ensure-restoring-correct-txn [:db/cas ::last-source-transaction ::last-source-transaction
+                                      (if (zero? current-t) 0 (dec t)) t]]
+    (reduce
+      (fn [acc id]
+        (let [resolved-id (if (= id tx-id)
+                            "datomic.tx"
+                            (resolve-id env id))]
+          (if (string? resolved-id)
+            (conj acc [:db/add resolved-id ::original-id id])
+            acc)))
+      [ensure-restoring-correct-txn]
+      unique-ids)))
+
+(defn resolved-txn
+  "Computes the transaction to write to the new database."
+  [{:keys [db id->attr source-refs] :as env} {:keys [t data] :as tx-entry}]
+  [(s/keys :req-un [::db ::id->attr ::source-refs]) ::txn => (s/coll-of ::txn-op :kind vector?)]
+  (let [tx-id (-> data first :tx)
+        tm    (:v (first (filter #(and (= tx-id (:e %))
+                                    (inst? (:v %))) data)))
+        env   (assoc env :tx-id tx-id)]
+    (if (< (compare tm #inst "2000-01-01") 0)
+      []
+      (into (bookkeeping-datoms env tx-entry)
+        (map
+          (fn [{:keys      [e v added]
+                original-a :a}]
+            (let [op (if added :db/add :db/retract)
+                  e  (resolve-id env e)
+                  a  (resolve-id env original-a)
+                  v  (cond
+                       (and (keyword? a) (= "db" (namespace a)) (int? v)) (resolve-id env v)
+                       (= a :db.install/attribute) (str v)
+                       (contains? source-refs original-a) (resolve-id env v)
+                       :else v)]
+              [op e a v])))
+        data))))
+
 (defn restore-segment!
   "Restore a segment of a backup.
 
 
   * source-database-name - The name used during backup.
-  * conn - The connection of the target db on which to restore.
+  * target-conn - The connection of the target db on which to restore.
   * backup-store - A durable store that was used to save the database
-  * id-mapper - A durable ID mapper that was used when saving the segments to backup-store
-  * start-t - Where to resume restoration from. Should be 0 for the first segment, and then the value returned by the
+  * start-t - Where to resume restoration from. Should be 0 or 1 for the first segment, and then the value returned by the
    prior invocation.
   * options - A map of other options
   ** :blacklist - A set of keywords (attributes) to elide from all transactions.
   ** :rewrite - A map from attribute keyword to a `(fn [attr value] new-value)` that can be used to obfuscate the original value to a new one.
 
-  There is a global atom in this ns called `abort-import?` which this function sets to false. If you set it to true it
-  will cause this restore to terminate early.
-
-  WARNING: You should avoid calling this function when you are rebooting/restarting the machine. There is
-  a small time window between running a transaction and saving the tempid remappings that, if interrupted,
-  will lose the mapping, which in turn can corrupt your recovery. Ideally you would have something like
-  a Redis flag that you could toggle in order to pause your restore so you can safely redeploy.
-
   Returns the next `start-t` that is needed to continue restoration.
   "
-  [source-database-name conn backup-store id-mapper start-t {:keys [blacklist rewrite]
-                                                             :or   {blacklist #{}}}]
-  (let [{:keys [end-t info transactions] :as tgi} (-load-transactions backup-store source-database-name start-t)
-        {ref?              :ref-attrs
-         attr->original-id :ident-lookup-map} info
-        target-attr->id          (build-ident-lookup (d/db conn))
-        id->attr                 (set/map-invert attr->original-id)
-        incoming-id->target-id   (into {}
-                                   (keep (fn [[attr id]]
-                                           (when-let [target-id (get target-attr->id attr)]
-                                             [id target-id]))) attr->original-id)
-        transactions-of-interest (normalize-txns {:id->attr  id->attr
-                                                  :to-one?   (partial to-one? (d/db conn))
-                                                  :blacklist blacklist
-                                                  :rewrite   rewrite} transactions)
-        resolve                  (fn [id] (or (dcbp/resolve-id id-mapper source-database-name id) (str id)))]
-
-    ;; Make sure any new schema (idents) have proper id resolution
-    (dcbp/store-id-mappings! id-mapper source-database-name incoming-id->target-id)
-
-    (when (empty? transactions-of-interest)
-      (log/info "Skipping transaction range" (:start-t tgi) "-" end-t
-        "It is empty (early transactions are datomic-specific and are never restored)."))
-
-    (doseq [{:keys [t data]} transactions-of-interest]
-      (let [data          (mapv
-                            (fn [[op e a v]]
-                              (let [e (resolve e)
-                                    v (if (ref? a)
-                                        (resolve v)
-                                        v)]
-                                [op e a v]))
-                            data)
-            {:keys [tempids
-                    error]} (try
-                              (d/transact conn {:tx-data data
-                                                :timeout 10000000})
+  [source-database-name target-conn backup-store start-t {:keys [blacklist rewrite]
+                                                          :or   {blacklist #{}}}]
+  (when (< start-t 2) (ensure-restore-schema! target-conn))
+  (let [{:keys [end-t refs id->attr transactions] :as tgi} (-load-transactions backup-store source-database-name start-t)
+        current-db      (d/db target-conn)
+        last-restored-t (log/spy :info "last-t" (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction)))]
+    (doseq [{:keys [t data] :as tx-entry} transactions
+            :when (> t last-restored-t)]
+      (let [db  (d/db target-conn)
+            txn (resolved-txn {:db          db
+                               :id->attr    id->attr
+                               :source-refs refs} tx-entry)
+            txn (normalize-txn {:to-one?   (partial to-one? (d/db target-conn))
+                                :id->attr  id->attr
+                                :blacklist blacklist
+                                :rewrite   rewrite} txn)
+            {:keys [error]} (try
+                              (when (seq txn)
+                                (let [result (d/transact target-conn {:tx-data (log/spy :info txn)
+                                                                      :timeout 10000000})]
+                                  (log/spy :info "REMAPS" (:tempids result))
+                                  result))
                               (catch ExceptionInfo e
                                 (let [{:db/keys [error]} (ex-data e)]
                                   (if (= error :db.error/past-tx-instant)
@@ -292,21 +372,14 @@
                                       (log/error e "Restore transaction failed!"
                                         {:db         source-database-name
                                          :t          t
-                                         :tx-content data})
+                                         :tx-content txn})
                                       {:error e}))))
                               (catch Exception e
                                 (log/error e "Restore transaction failed!"
                                   {:db         source-database-name
                                    :t          t
-                                   :tx-content data})
-                                {:error e}))
-            addl-rewrites (reduce-kv (fn [acc tempid realid]
-                                       (if (= tempid "datomic.tx")
-                                         acc
-                                         (assoc acc (Long/parseLong tempid) realid)))
-                            {}
-                            tempids)]
-        (dcbp/store-id-mappings! id-mapper source-database-name addl-rewrites)
+                                   :tx-content txn})
+                                {:error e}))]
         (when error
           (throw error))))
     (inc end-t)))
