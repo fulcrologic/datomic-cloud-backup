@@ -16,11 +16,11 @@
 (s/def ::db #(satisfies? dp/Db %))
 (s/def ::datom #(int? (:e %)))
 (s/def ::t int?)
-(s/def ::data (s/coll-of ::datom))
+(s/def ::data any?)
 (s/def ::txn (s/keys :req-un [::t ::data]))
 (s/def ::connection #(satisfies? dp/Connection %))
 (s/def ::e (s/or :tmp string? :real int? :ident keyword? :special #{:db.part/db}))
-(s/def ::a (s/or :id int? :ident keyword?))
+(s/def ::a (s/or :id int? :ident keyword? :tmpid string?))
 (s/def ::v any?)
 (s/def ::op #{:db/add :db/retract})
 (s/def ::casop #{:db/cas})
@@ -300,7 +300,7 @@
       [ensure-restoring-correct-txn]
       unique-ids)))
 
-(defn resolved-txn
+(>defn resolved-txn
   "Computes the transaction to write to the new database."
   [{:keys [db id->attr source-refs] :as env} {:keys [t data] :as tx-entry}]
   [(s/keys :req-un [::db ::id->attr ::source-refs]) ::txn => (s/coll-of ::txn-op :kind vector?)]
@@ -345,7 +345,7 @@
   (when (< start-t 2) (ensure-restore-schema! target-conn))
   (let [{:keys [end-t refs id->attr transactions] :as tgi} (-load-transactions backup-store source-database-name start-t)
         current-db      (d/db target-conn)
-        last-restored-t (log/spy :info "last-t" (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction)))]
+        last-restored-t (log/spy :trace "last-t" (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction)))]
     (doseq [{:keys [t data] :as tx-entry} transactions
             :when (> t last-restored-t)]
       (let [db  (d/db target-conn)
@@ -358,9 +358,9 @@
                                 :rewrite   rewrite} txn)
             {:keys [error]} (try
                               (when (seq txn)
-                                (let [result (d/transact target-conn {:tx-data (log/spy :info txn)
+                                (let [result (d/transact target-conn {:tx-data (log/spy :trace txn)
                                                                       :timeout 10000000})]
-                                  (log/spy :info "REMAPS" (:tempids result))
+                                  (log/spy :trace "REMAPS" (:tempids result))
                                   result))
                               (catch ExceptionInfo e
                                 (let [{:db/keys [error]} (ex-data e)]

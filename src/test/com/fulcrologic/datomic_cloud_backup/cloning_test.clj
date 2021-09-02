@@ -320,22 +320,21 @@
         (d/delete-database client {:db-name db-name})
         (d/delete-database client {:db-name target-db-name})))))
 
-(specification "Backup" :focus
+(specification "Backup"
   (component "Using Test Stores (RAM-Based)"
     (run-tests :db1 (new-ram-store)))
-  #_#_(component "Using Filesystem/RAM mapper"
-        (let [tmpdirfile (.toFile (Files/createTempDirectory "" (make-array FileAttribute 0)))
-              tempdir    (.getAbsolutePath tmpdirfile)]
-          (run-tests :db1 (new-filesystem-store tempdir))
-          (clean-filesystem! tmpdirfile)))
-      (component "Using AWS/Redis"
-        (if (and (aws-credentials?) (available? {}))
-          (let [dbname (keyword (gensym "test"))]
-            (clear-mappings! {} dbname)
-            (run-tests dbname (new-s3-store "datomic-cloning-test-bucket")))
-          (assertions
-            "Resources not available. Test skipped"
-            true => true))))
+  (component "Using Filesystem"
+    (let [tmpdirfile (.toFile (Files/createTempDirectory "" (make-array FileAttribute 0)))
+          tempdir    (.getAbsolutePath tmpdirfile)]
+      (run-tests :db1 (new-filesystem-store tempdir))
+      (clean-filesystem! tmpdirfile)))
+  (component "Using S3"
+    (if (and (aws-credentials?))
+      (let [dbname (keyword (gensym "test"))]
+        (run-tests dbname (new-s3-store "datomic-cloning-test-bucket")))
+      (assertions
+        "Resources not available. Test skipped"
+        true => true))))
 
 (specification "Parallel backup"
   (let [tmpdir      (.toFile (Files/createTempDirectory "test" (make-array FileAttribute 0)))
