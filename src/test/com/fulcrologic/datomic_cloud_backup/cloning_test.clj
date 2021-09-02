@@ -139,7 +139,7 @@
           :v)
         => 0))))
 
-(specification "Bookkeeping datoms"
+(specification "Bookkeeping transaction"
   (let [db-name        (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
         _              (d/create-database client {:db-name db-name})
@@ -171,7 +171,7 @@
                          :db/valueType   :db.type/string}])
 
       (let [db     (d/db target-conn)
-            datoms (cloning/bookkeeping-datoms {:db db} schema-entry)
+            datoms (cloning/bookkeeping-txn {:db db} schema-entry)
             {:keys [t]} schema-entry]
         (assertions
           "Adds a CAS operation to ensure the entry being restored in the correct one"
@@ -195,7 +195,7 @@
                           :person/name          "Joe"}]})
               tx-id  (->> tx2-entry :data (filter (fn [{:keys [v]}] (inst? v))) (map :e) (first))
               db     (d/db target-conn)
-              datoms (cloning/bookkeeping-datoms {:db db} tx2-entry)]
+              datoms (cloning/bookkeeping-txn {:db db} tx2-entry)]
           (assertions
             "Fixes tempids on the tx and new items"
             (vec (rest datoms)) => [[:db/add "datomic.tx" ::cloning/original-id tx-id]

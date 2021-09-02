@@ -280,7 +280,11 @@
                 :e)
               (str old-id)))))
 
-(defn bookkeeping-datoms
+(>defn bookkeeping-txn
+  "Generates a transaction that includes a CAS that verifies the current basis t of the database is the intended
+   target, and the adds ::original-id datoms for every tempid necessary in the transaction to track the original
+   source (as in source database) entity. This allows future transactions to simply look up the current ID of an
+   original ID during ID resolution."
   [{:keys [db] :as env} {:keys [t data]}]
   [(s/keys :req-un [::db]) ::txn => (s/coll-of ::txn-op :kind vector?)]
   (let [unique-ids                   (into #{} (map :e) (vec data))
@@ -301,7 +305,17 @@
       unique-ids)))
 
 (>defn resolved-txn
-  "Computes the transaction to write to the new database."
+  "This function rewrites an incoming transaction log `tx-entry` into
+   a Datomic transaction that remaps the necessary IDs to maintain referential integrity.
+
+   The transaction will include what `bookkeeping-txn` outputs, and all of the transaction data as
+   new transaction operations that have had their IDs remapped according to what has already been restored (e and a, and
+   v when a is a ref).
+
+   This function requires the current target db (for resolving original IDs), `id->attr` for finding the mappings from
+   the base datomic schema in the old database to the new one, and a set of attribute db ids (in the source db)
+   that represent ref attributes in the source database (`source-refs`).
+   "
   [{:keys [db id->attr source-refs] :as env} {:keys [t data] :as tx-entry}]
   [(s/keys :req-un [::db ::id->attr ::source-refs]) ::txn => (s/coll-of ::txn-op :kind vector?)]
   (let [tx-id (-> data first :tx)
@@ -310,7 +324,7 @@
         env   (assoc env :tx-id tx-id)]
     (if (< (compare tm #inst "2000-01-01") 0)
       []
-      (into (bookkeeping-datoms env tx-entry)
+      (into (bookkeeping-txn env tx-entry)
         (map
           (fn [{:keys      [e v added]
                 original-a :a}]
