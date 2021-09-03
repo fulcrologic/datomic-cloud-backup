@@ -22,14 +22,11 @@
 (defn backup! [dbname source-connection target-store]
   (loop [n (cloning/backup-next-segment! dbname source-connection target-store 2)]
     (when (pos? n)
+      (Thread/sleep 10)
       (recur (cloning/backup-next-segment! dbname source-connection target-store 2)))))
 
 (defn restore! [dbname target-conn db-store]
-  (loop [start-t 0]
-    (let [next-start (cloning/restore-segment! dbname target-conn db-store start-t {})
-          last-t     7]
-      (when (<= next-start last-t)
-        (recur next-start)))))
+  (while (= :restored-segment (cloning/restore-segment! dbname target-conn db-store {}))))
 
 (defn clean-filesystem! [^File tmpdir]
   (when (and (.exists tmpdir) (.isDirectory tmpdir) (str/starts-with? (.getAbsolutePath tmpdir) "/t"))
@@ -75,7 +72,7 @@
         {{:strs [BOB MAIN]} :tempids} (last (mapv (fn [txn]
                                                     (Thread/sleep 1)
                                                     (d/transact conn {:tx-data txn})) txns))]
-    ;; This is here to make sure IDs don't align
+    ;; Hack to make sure IDs don't align internally, so that less likely to get false success
     (d/transact target-conn {:tx-data [{:db/ident       :thing/id
                                         :db/valueType   :db.type/long
                                         :db/unique      :db.unique/identity
@@ -84,10 +81,10 @@
                                         :db/valueType   :db.type/long
                                         :db/unique      :db.unique/identity
                                         :db/cardinality :db.cardinality/one}
-                                       [:db/add "datomic.tx" :db/txInstant #inst "2020-01-01"]]})
+                                       [:db/add "datomic.tx" :db/txInstant #inst "1970-01-01T12:00"]]})
     (d/transact target-conn {:tx-data [{:db/id    "new-thing"
                                         :thing/id 99}
-                                       [:db/add "datomic.tx" :db/txInstant #inst "2020-01-01T00:00:01"]]})
+                                       [:db/add "datomic.tx" :db/txInstant #inst "1970-01-01T12:01"]]})
 
     (try
       (component "incremental backup"
@@ -320,7 +317,7 @@
         (d/delete-database client {:db-name db-name})
         (d/delete-database client {:db-name target-db-name})))))
 
-(specification "Backup"
+(specification "Backup" :focus
   (component "Using Test Stores (RAM-Based)"
     (run-tests :db1 (new-ram-store)))
   (component "Using Filesystem"
@@ -391,7 +388,7 @@
     => [{:start-t 106 :end-t 110}
         {:start-t 119 :end-t 146}]))
 
-(specification "repair-backup!"
+(specification "repair-backup!" :focus
   (let [db-name        (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
         schema         [{:db/ident       :person/id
@@ -411,7 +408,7 @@
     (try
       (dotimes [n 1000]
         (d/transact conn {:tx-data [{:person/id   n
-                                     :person/name "Bob"}]}))
+                                     :person/name (str "Bob " n)}]}))
 
       (cloning/backup-segment! db-name conn store 1 300)
       (cloning/backup-segment! db-name conn store 330 565)
@@ -430,8 +427,8 @@
 
       (let [_           (d/create-database client {:db-name target-db-name})
             target-conn (d/connect client {:db-name target-db-name})]
-        (doseq [{:keys [start-t] :as segment} (dcbp/saved-segment-info store db-name)]
-          (cloning/restore-segment! db-name target-conn store start-t {}))
+        (while (= :restored-segment (cloning/restore-segment! db-name target-conn store {}))
+          (cloning/restore-segment! db-name target-conn store {}))
         (let [db  (d/db target-conn)
               cnt (ffirst (try (d/q '[:find (count ?p) :where [?p :person/name]] db)
                                (catch Exception e nil)))]
@@ -473,8 +470,8 @@
             target-conn (d/connect client {:db-name target-db-name})]
 
         (assertions
-          "Restore returns the next start-t that should be used"
-          (cloning/restore-segment! db-name target-conn store 1 {}) => 10)
+          "Restore :restored-segment when it restores some data"
+          (cloning/restore-segment! db-name target-conn store {}) => :restored-segment)
 
         (let [group          (dcbp/load-transaction-group store db-name 10)
               real-load-txns cloning/-load-transactions]
@@ -485,11 +482,11 @@
             (cloning/-load-transactions s n start) => (real-load-txns s n start)
 
             ;; First attempt on this segment only gets half of them
-            (cloning/restore-segment! db-name target-conn store 10 {})
+            (cloning/restore-segment! db-name target-conn store {})
             ;; Retry should get the rest, an complain about the duplicates
-            (cloning/restore-segment! db-name target-conn store 10 {})
+            (cloning/restore-segment! db-name target-conn store {})
             ;; Load the remainder of the database
-            (cloning/restore-segment! db-name target-conn store 20 {})
+            (cloning/restore-segment! db-name target-conn store {})
 
             (assertions
               "Resuming succeeds"

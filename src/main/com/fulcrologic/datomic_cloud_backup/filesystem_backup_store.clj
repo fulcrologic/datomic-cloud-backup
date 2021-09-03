@@ -58,7 +58,7 @@
       (put-compressed-edn base-directory nm transaction-group)))
   (load-transaction-group [this dbname start-t]
     (let [segments (dcbp/saved-segment-info this dbname)
-          start-t  (if (= 0 start-t)
+          start-t  (if (< start-t 2)
                      (:start-t (first segments))
                      start-t)
           {:keys [filename]} (first (filter #(= start-t (:start-t %)) segments))]

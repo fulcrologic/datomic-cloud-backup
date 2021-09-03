@@ -15,6 +15,7 @@
 
 (s/def ::db #(satisfies? dp/Db %))
 (s/def ::datom #(int? (:e %)))
+(s/def ::db-name (s/or :string string? :k keyword?))
 (s/def ::t int?)
 (s/def ::data any?)
 (s/def ::txn (s/keys :req-un [::t ::data]))
@@ -199,9 +200,13 @@
     (remove #(contains? blacklist (nth % 2)))
     vec))
 
-(>defn tx-time [{:keys [data]}]
-  [::txn => (? inst?)]
-  (last (first (filter #(= :db/txInstant (nth % 2)) data))))
+(>defn tx-time
+  "Returns the transaction time of an entry from a tx-entry."
+  [{:keys [data]}]
+  [::txn => inst?]
+  (let [tx-id (:tx (first data))
+        tm    (:v (first (filter #(= tx-id (:e %)) data)))]
+    (or tm #inst "1970-01-01")))
 
 (defn -load-transactions
   "Protocols don't mock well. This is just a wrapper to facilitate a testing scenario."
@@ -318,12 +323,15 @@
    "
   [{:keys [db id->attr source-refs] :as env} {:keys [t data] :as tx-entry}]
   [(s/keys :req-un [::db ::id->attr ::source-refs]) ::txn => (s/coll-of ::txn-op :kind vector?)]
-  (let [tx-id (-> data first :tx)
-        tm    (:v (first (filter #(and (= tx-id (:e %))
-                                    (inst? (:v %))) data)))
+  (let [tx-id (log/spy :trace "tx-id" (-> data first :tx))
+        tm    (log/spy :trace "tm" (tx-time tx-entry))
         env   (assoc env :tx-id tx-id)]
     (if (< (compare tm #inst "2000-01-01") 0)
-      []
+      ;; Record that we has an empty transaction. The timestamp here is a bit of a pain, since I'm just
+      ;; guessing...but it looks like datomic internals set their timestamp to the UNIX epoch
+      (let [tx-time (Date. (long (log/spy :trace (+ t (inst-ms #inst "1970-01-02")))))]
+        [[:db/cas ::last-source-transaction ::last-source-transaction (dec t) t]
+         [:db/add "datomic.tx" :db/txInstant tx-time]])
       (into (bookkeeping-txn env tx-entry)
         (map
           (fn [{:keys      [e v added]
@@ -339,64 +347,87 @@
               [op e a v])))
         data))))
 
-(defn restore-segment!
-  "Restore a segment of a backup.
+(defn find-segment-start-t
+  "When resuming a backup the last t in the database won't likely be on a segment boundary. This scans the real segments
+   to find the correct start-t for loading."
+  [store dbname desired-start-t]
+  (if (= desired-start-t (:start-t (dcbp/last-segment-info store dbname)))
+    desired-start-t
+    (let [saved-segments (dcbp/saved-segment-info store dbname)]
+      (->> saved-segments
+        (filter (fn [{:keys [start-t end-t]}]
+                  (<= start-t desired-start-t end-t)))
+        first
+        :start-t))))
 
+(>defn restore-segment!
+  "Restore the next segment of a backup. Auto-detects (from the target database) where to resume.
 
-  * source-database-name - The name used during backup.
+  Returns one of three possible values:
+
+  * :restored-segment - Real work was done to restore more data.
+  * :nothing-new-available - The backup is restored to the current end. There was nothing to do.
+  * :transaction-failed! - The restore tried to restore data, but something went wrong. Check the logs. MAY work
+    if re-attempted (e.g. if it was a temporary Datomic outage)
+
+  The arguments are:
+
+  * source-database-name - The name used for this backup.
   * target-conn - The connection of the target db on which to restore.
   * backup-store - A durable store that was used to save the database
-  * start-t - Where to resume restoration from. Should be 0 or 1 for the first segment, and then the value returned by the
-   prior invocation.
   * options - A map of other options
   ** :blacklist - A set of keywords (attributes) to elide from all transactions.
   ** :rewrite - A map from attribute keyword to a `(fn [attr value] new-value)` that can be used to obfuscate the original value to a new one.
-
-  Returns the next `start-t` that is needed to continue restoration.
   "
-  [source-database-name target-conn backup-store start-t {:keys [blacklist rewrite]
-                                                          :or   {blacklist #{}}}]
-  (when (< start-t 2) (ensure-restore-schema! target-conn))
-  (let [{:keys [end-t refs id->attr transactions] :as tgi} (-load-transactions backup-store source-database-name start-t)
-        current-db      (d/db target-conn)
-        last-restored-t (log/spy :trace "last-t" (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction)))]
-    (doseq [{:keys [t data] :as tx-entry} transactions
-            :when (> t last-restored-t)]
-      (let [db  (d/db target-conn)
-            txn (resolved-txn {:db          db
-                               :id->attr    id->attr
-                               :source-refs refs} tx-entry)
-            txn (normalize-txn {:to-one?   (partial to-one? (d/db target-conn))
-                                :id->attr  id->attr
-                                :blacklist blacklist
-                                :rewrite   rewrite} txn)
-            {:keys [error]} (try
-                              (when (seq txn)
-                                (let [result (d/transact target-conn {:tx-data (log/spy :trace txn)
-                                                                      :timeout 10000000})]
-                                  (log/spy :trace "REMAPS" (:tempids result))
-                                  result))
-                              (catch ExceptionInfo e
-                                (let [{:db/keys [error]} (ex-data e)]
-                                  (if (= error :db.error/past-tx-instant)
-                                    (do
-                                      (log/warn "Transaction was already processed. Skipping" source-database-name t)
-                                      {:tempids {}})
-                                    (do
-                                      (log/error e "Restore transaction failed!"
-                                        {:db         source-database-name
-                                         :t          t
-                                         :tx-content txn})
-                                      {:error e}))))
-                              (catch Exception e
-                                (log/error e "Restore transaction failed!"
-                                  {:db         source-database-name
-                                   :t          t
-                                   :tx-content txn})
-                                {:error e}))]
-        (when error
-          (throw error))))
-    (inc end-t)))
+  [source-database-name target-conn backup-store {:keys [blacklist rewrite]
+                                                  :or   {blacklist #{}}}]
+  [::db-name ::connection ::dcbp/store (s/keys :opt-un [::blacklist ::rewrite]) => #{:restored-segment
+                                                                                     :nothing-new-available
+                                                                                     :transaction-failed!}]
+  (log/spy :trace source-database-name)
+  (let [current-db      (d/db target-conn)
+        last-restored-t (log/spy :trace "last-t" (or
+                                                   (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
+                                                   0))
+        desired-start-t (log/spy :trace "desired-start-t" (if (and last-restored-t (pos? last-restored-t)) (inc last-restored-t) 1))
+        {last-available-start-t :start-t} (log/spy :trace "last-backed-up-t" (dcbp/last-segment-info backup-store source-database-name))]
+    (if (or (nil? last-available-start-t) (< last-available-start-t desired-start-t))
+      :nothing-new-available
+      (let
+        [segment-start-t (if (< desired-start-t 2) desired-start-t (find-segment-start-t backup-store source-database-name desired-start-t))
+         {:keys [refs id->attr transactions] :as tgi} (-load-transactions backup-store source-database-name (log/spy :trace segment-start-t))
+         result          (atom :restored-segment)]
+        (when (< segment-start-t 2) (ensure-restore-schema! target-conn))
+        (log/infof "Restoring %s segment %d starting at %d." source-database-name segment-start-t desired-start-t)
+        (doseq [{:keys [t] :as tx-entry} transactions
+                :when (and (> (log/spy :trace t) (log/spy :trace last-restored-t)) (= @result :restored-segment))]
+          (let [db             (d/db target-conn)
+                resolved-txn   (resolved-txn {:db          db
+                                              :id->attr    id->attr
+                                              :source-refs refs} (log/spy :trace tx-entry))
+                normalized-txn (normalize-txn {:to-one?   (partial to-one? (d/db target-conn))
+                                               :id->attr  id->attr
+                                               :blacklist blacklist
+                                               :rewrite   rewrite} (log/spy :trace resolved-txn))]
+            (try
+              (log/trace "Current basis time of the database" (inst-ms (tx-time (last (d/tx-range target-conn {:start 0 :limit 1000})))))
+              (log/trace "Basis time of the entry" (inst-ms (tx-time tx-entry)))
+              (when (empty? (log/spy :trace normalized-txn))
+                (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
+              (let [tx-result (d/transact target-conn {:tx-data (log/spy :debug "TRANSACTING" normalized-txn)
+                                                       :timeout 10000000})]
+                (log/spy :trace "REMAPS" (:tempids tx-result))
+                (reset! result :restored-segment))
+              (catch Exception e
+                (let [{:db/keys [error]} (ex-data e)]
+                  (reset! result :transaction-failed!)
+                  (log/error e "Restore transaction failed!"
+                    {:db          source-database-name
+                     :message     (ex-message e)
+                     :data        (ex-data e)
+                     :t           t
+                     :transaction normalized-txn}))))))
+        @result))))
 
 (defn backup-gaps
   "Looks for gaps in the given segments (maps of :start-t and :end-t inclusive, which is what the db store's
@@ -441,3 +472,5 @@
         (backup-segment! dbname conn db-store start-t end-t)))))
 
 
+(comment
+  (taoensso.timbre/set-level! :info))
