@@ -321,13 +321,13 @@
    "
   [{:keys [db id->attr source-refs] :as env} {:keys [t data] :as tx-entry}]
   [(s/keys :req-un [::db ::id->attr ::source-refs]) ::txn => (s/coll-of ::txn-op :kind vector?)]
-  (let [tx-id (log/spy :trace "tx-id" (-> data first :tx))
-        tm    (log/spy :trace "tm" (tx-time tx-entry))
+  (let [tx-id (-> data first :tx)
+        tm    (tx-time tx-entry)
         env   (assoc env :tx-id tx-id)]
     (if (< (compare tm #inst "2000-01-01") 0)
       ;; Record that we has an empty transaction. The timestamp here is a bit of a pain, since I'm just
       ;; guessing...but it looks like datomic internals set their timestamp to the UNIX epoch
-      (let [tx-time (Date. (long (log/spy :trace (+ t (inst-ms #inst "1970-01-02")))))]
+      (let [tx-time (Date. (long (+ t (inst-ms #inst "1970-01-02"))))]
         [[:db/cas ::last-source-transaction ::last-source-transaction (dec t) t]
          [:db/add "datomic.tx" :db/txInstant tx-time]])
       (into (bookkeeping-txn env tx-entry)
@@ -384,39 +384,39 @@
                                                                                      :transaction-failed!}]
   (log/spy :trace source-database-name)
   (let [current-db             (d/db target-conn)
-        last-restored-t        (log/spy :trace "last-t" (or
-                                                          (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
-                                                          0))
-        desired-start-t        (log/spy :trace "desired-start-t" (if (and last-restored-t (pos? last-restored-t)) (inc last-restored-t) 1))
-        {last-available-start-t :start-t} (log/spy :trace "last-backed-up-t" (dcbp/last-segment-info backup-store source-database-name))
+        last-restored-t        (or
+                                 (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
+                                 0)
+        desired-start-t        (if (and last-restored-t (pos? last-restored-t)) (inc last-restored-t) 1)
+        {last-available-start-t :start-t} (dcbp/last-segment-info backup-store source-database-name)
         last-available-start-t (if (and last-available-start-t (zero? last-available-start-t)) 1 last-available-start-t)]
     (if (or (nil? last-available-start-t) (< last-available-start-t desired-start-t))
       :nothing-new-available
       (let
         [segment-start-t (if (< desired-start-t 2) desired-start-t (find-segment-start-t backup-store source-database-name desired-start-t))
-         {:keys [refs id->attr transactions] :as tgi} (-load-transactions backup-store source-database-name (log/spy :trace segment-start-t))
+         {:keys [refs id->attr transactions] :as tgi} (-load-transactions backup-store source-database-name segment-start-t)
          result          (atom :restored-segment)]
         (when (< segment-start-t 2) (ensure-restore-schema! target-conn))
         (log/infof "Restoring %s segment %d starting at %d." source-database-name segment-start-t desired-start-t)
         (doseq [{:keys [t] :as tx-entry} transactions
-                :when (and (> (log/spy :trace t) (log/spy :trace last-restored-t)) (= @result :restored-segment))]
+                :when (and (> t last-restored-t) (= @result :restored-segment))]
           (let [db             (d/db target-conn)
                 resolved-txn   (resolved-txn {:db          db
                                               :id->attr    id->attr
-                                              :source-refs refs} (log/spy :trace tx-entry))
+                                              :source-refs refs} tx-entry)
                 normalized-txn (normalize-txn {:to-one?   (partial to-one? (d/db target-conn))
                                                :id->attr  id->attr
                                                :blacklist blacklist
-                                               :rewrite   rewrite} (log/spy :trace resolved-txn))]
+                                               :rewrite   rewrite} resolved-txn)]
             (try
               (log/trace "Current basis time of the database" (inst-ms (tx-time (last (d/tx-range target-conn {:start 0 :limit 1000})))))
               (log/trace "Basis time of the entry" (inst-ms (tx-time tx-entry)))
-              (when (empty? (log/spy :trace normalized-txn))
+              (when (empty? normalized-txn)
                 (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
-              (let [tx-result (d/transact target-conn {:tx-data (log/spy :debug "TRANSACTING" normalized-txn)
-                                                       :timeout 10000000})]
-                (log/spy :trace "REMAPS" (:tempids tx-result))
-                (reset! result :restored-segment))
+              (log/debug "Transaction:" normalized-txn)
+              (d/transact target-conn {:tx-data normalized-txn
+                                       :timeout 10000000})
+              (reset! result :restored-segment)
               (catch Exception e
                 (let [{:db/keys [error]} (ex-data e)]
                   (reset! result :transaction-failed!)
