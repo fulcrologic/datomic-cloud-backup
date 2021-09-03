@@ -38,136 +38,93 @@ this transaction log into a new database. The one major complication is that the
 different IDs to the new entities as they are transacted, thus, we must keep track of what these new IDs are
 in the new database so we can remap them in later incremental steps.
 
-Thus, there is a need for two kinds of durable storage (they have different characteristics, so they
-are represented as two protocols):
+The storage for the backups is represented with the protocol:
 
 * `BackupStore` - A place to store the actual transactions
-* `IDMapper` - A fast durable K/V store that can track ID mappings in the new database over (a potentially long) time.
 
-This library comes with a sample `BackupStore` based on AWS s3, and an `IDMapper` that uses Redis (via carmine).
+This library comes with a sample `BackupStore` based on Filesystems and AWS S3.
 
 === Extra Dependencies May Be Required
 
-If you want to use these, then you MUST add the following two libraries to your dependencies (they are
+If you want to use the supplied S3 file store then you MUST add the following to your dependencies (they are
 not included as transitive dependencies in case you want to use something else):
 
 * `com.datomic/dev-local`         - if you want to play with it in dev mode
-* `com.taoensso/carmine`          - if you want to use the RedisIDMapper
 * `com.amazonaws/aws-java-sdk-s3` - if you want to use the S3BackupStore
-* `com.taoensso/nippy`            - for S3BackupStore
 
-You will then need to add this library to your application that you are deploying to the cloud,
-and run, on a periodic basis, an incremental backup.
+You will then need to add the backup library to your application that you are deploying to the cloud,
+and run (on a periodic basis) an incremental backup.
 
-=== Sample Backup Strategy
+=== Running a Backup
 
-Here's a very naive implementation that would allow you to clone an entire database using
-resources in the cloud.
+Basically create a `BackupStore` (`db-store` in the example) that your restoration process will be able to see,
+and then periodically run a function like this:
 
 [source]
 -----
-(ns com.fulcrologic.datomic-cloud-backup.cloning-test
-  (:require
-    [datomic.client.api :as d]
-    [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
-    [com.fulcrologic.datomic-cloud-backup.cloning :as cloning]
-    [com.fulcrologic.datomic-cloud-backup.ram-stores :refer [new-ram-store new-ram-mapper]]
-    [com.fulcrologic.datomic-cloud-backup.s3-backup-store :refer [new-s3-store aws-credentials?]]
-    [com.fulcrologic.datomic-cloud-backup.redis-id-mapper :refer [new-redis-mapper available? clear-mappings!]]
-    [fulcro-spec.core :refer [specification behavior component assertions =>]])
-  (:import (java.util UUID)))
-
-(defonce client (d/client {:server-type :dev-local
-                           :storage-dir :mem
-                           :system      "test"}))
-
-(defn backup! [dbname source-connection target-store]
-  ;; Normally, you'd not write this as a tight loop, but would instead monitor if it is returning
-  ;; positive numbers and pause when it isn't, as an infinite loop to keep streaming.
-  (loop [n (cloning/backup-next-segment! dbname source-connection target-store 2)]
-    (when (pos? n)
-      (recur (cloning/backup-next-segment! dbname source-connection target-store 2)))))
-
-(defn restore! [dbname target-conn db-store mapper]
-  ;; Normally you'd have some hot standby continuously running this loop. The `next-start` may not yet
-  ;; be available, so if it stays the same, delay for a bit to see if a new one arrives.
-  (loop [start-t 0]
-    (let [next-start (cloning/restore-segment! dbname target-conn db-store mapper start-t {})]
-      (when (< start-t next-start)
-        (recur next-start)))))
-
-(comment
-  ;; Clone a db using RAM resources. Probably runs out of memory for anything
-  ;; but small dbs.
-  (let [c (d/connect client {:db-name "some-database"})
-        target-c (d/connect client {:db-name "restored"})
-        store (new-ram-store)
-        mapper (new-ram-mapper)]
-    (backup! :some-database c store)
-    (restore! :some-database target-c store mapper))
-
-  ;; Same thing, but uses S3 resources and Redis. Should handle any db size as
-  ;; long as Redis has space for all of the ID mappings
-  (let [c (d/connect client {:db-name "some-database"})
-        target-c (d/connect client {:db-name "restored"})
-        store (new-s3-store "my-s3-bucket")
-        mapper (new-redis-mapper {:spec {:host "localhost"}})]
-    (backup! :some-database c store)
-    (restore! :some-database target-c store mapper)))
+(defn backup-step!
+  "Backs up a maximum of txns-per-backup-segment, starting where we last left off. Returns the actual number
+  of transactions written."
+  [dbname conn db-store txns-per-backup-segment]
+  (let [{:keys [end-t]} (dcbp/last-segment-info db-store dbname)]
+    (if (and end-t (pos? end-t))
+      (let [next-start (inc end-t)
+            max-t      (min (+ next-start txns-per-backup-segment) (:t (d/db conn)))]
+        (if (pos? (- max-t next-start))
+          (try
+            (let [{:keys [start-t end-t]} (cloning/backup-segment! dbname conn db-store next-start max-t)]
+              (inc (- end-t start-t)))
+            (catch Exception e
+              (log/error e "Incremental backup step failed!")
+              0))
+          (do
+            (log/trace "There was nothing new to back up on" dbname)
+            0)))
+      (do
+        (log/warn "Not doing incremental backup step for" dbname "because there is no base backup in the store.")
+        0))))
 -----
 
-The Redis connection options are as described in the https://github.com/ptaoussanis/carmine[Carmine docs].
+Basically you just call `backup-segment!` on a periodic basis and it makes a new chunk.
 
-Notes:
+You can run a fast initial backup with `backup!`, which is capable of creating a large number of chunks (in parallel)
+for your initial step. Then you can start running the above loop without it taking as long to catch up.
 
-* The call to `backup-next-segment!` figures out where to start automatically. You tell
-  it how many transactions you want it to try to do (it stops if there are no more) and
-  it returns how many were done. Thus, if it returns 0 (or less than you asked) then
-  it is at or very near the end. If you sleep for some amount of time and try again,
-  then you'll be doing a hot streaming replication of your database.
-* The call to `restore-segment!` returns the next segment start time that it needs
-  in order to continue. If you call it with a `start-t` that does not yet exist, then
-  it will return that same `start-t`. Thus, you could sleep for some time and try again.
-  Doing so in an infinite loop results in streaming restoration of your database.
+=== Running a Restore
 
-The Redis mapper is only needed, as you can see, on the restore side. The store needs to
-be visible on both sides. Thus, an S3 bucket with proper permissions is the perfect way
-to share the streaming data across regions/zones.
+On a different machine that uses a different Datomic deployment (WARNING: restore uses the db names you use
+when backing up), you will need to make a simple application that uses this library to read the backup segments
+and apply them to a new (empty) database. The restore restores timestamps of transactions, so you MUST NOT transact
+anything against the target databases, or restore will not be able to proceed.
 
-=== Low-level Backups
+NOTE: We could relax this and lose the transaction times...perhaps as an option. Not implemented.
 
-The naive implementation above uses the store itself to find the next place to resume the
-backup.
+The `restore-segment!` function automatically figures out the next segment to restore, and applies it. It returns
+`:nothing-new-available` if there is nothing else to do, and `:restored-segment` it restored a segment. The
+simplest restore process would be:
 
-The base utility function `backup-segment!` is a little more general-purpose. It allows you
-to explicitly specify the transaction range to back up. This would allow you to track
-your progress in an alternate fashion, or build more complex approaches to backing up
-large amounts of data.
+[source]
+-----
+(while (= :restored-segment (cloning/restore-segment! dbname conn dbstore {})))
+-----
 
-One such approach is documented in the next section.
-
-=== Parallel Backups
-
-There is a function that is useful when you want to run an initial backup on a large database called
-`parallel-backup!`. It runs a complete backup of the database using `pmap` to provide concurrency
-that will adjust to the hardware on hand.
-
-My preliminary tests using a t3-medium instances with an s3 store in an alternate region while backing up
-1000 transactions per s3 object can back up about 40k transactions per minute using the parallel backup
-utility. This speed, of course, could vary dramatically based on your average datom size, and might change
-speed as the I/O subsystems scale out.
+Of course you'll want to do something more complex for streaming replication, since new segments will arrive after this
+loop finishes. You'll probably want to log progress, sleep when there is nothing available, etc.
 
 == NOTES
 
-* The :db/id of entities in the new database will *not* match the :db/id of the old entities in the old
-database. Refs will be fixed with respect to this, but if you store *external* data (e.g. s3 data indexed
-by :db/id) then those things will need to be remapped as well (which the IDMapper can help with).
-* So far this library is *very* lightly tested (soon to be remedied).
+* Two schema items are added to the TARGET database ::cloning/last-source-transaction and ::cloning/original-id.
+** `last-source-transaction` is the last t that has been restored. It is an ident, and there is exactly ONE datom
+in the database (with no history) that has this as both that ID and attribute: `[::cloning/last-source-transaction ::cloning/last-source-transaction 2]`
+** `original-id` is stored on *every* restored entity. It is the ID that the entity has in the SOURCE database, and is
+used for remapping incoming IDs, and as audit/source information.
 * You cannot *write* transactions to the target database during a restore and expect the restore to be able
 to continue. The restore tries to include the reified transactions to maintain any auditing data
 you may have added to the database. As such it is also restoring the original tx time, which
 it cannot do if you transact something that has a time close to "now".
-* Using an elision predicate on the restore can cause transactions to become empty. Those transactions will be skipped.
+* Using an elision predicate on the restore can cause transactions to become empty. Those transactions will be still
+be added to the database so that `last-source-transaction` is updated. This ensures that interrupted restores can be
+properly restarted, and that the basis of every transaction will match the original.
 
 == License
 
