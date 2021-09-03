@@ -205,7 +205,9 @@
   [{:keys [data]}]
   [::txn => inst?]
   (let [tx-id (:tx (first data))
-        tm    (:v (first (filter #(= tx-id (:e %)) data)))]
+        tm    (:v (first (filter #(and
+                                    (= tx-id (:e %))
+                                    (inst? (:v %))) data)))]
     (or tm #inst "1970-01-01")))
 
 (defn -load-transactions
@@ -231,13 +233,9 @@
 
 (defn tempid-tracking-schema-txns
   [connection]
-  (let [last-datoms (-> (d/tx-range connection {:start 1 :limit -1})
-                      last
-                      :data)
-        tx-id       (-> last-datoms first :tx)
-        time        (:v (first (filter #(and (= tx-id (:e %)) (inst? (:v %))) last-datoms)))
-        tma         (Date. (long (+ 1000 (inst-ms time))))
-        tmb         (Date. (long (+ 2000 (inst-ms time))))]
+  (let [time (-> (d/tx-range connection {:start 1 :limit -1}) last tx-time)
+        tma  (Date. (long (+ 1000 (inst-ms time))))
+        tmb  (Date. (long (+ 2000 (inst-ms time))))]
     [[{:db/id        "datomic.tx"
        :db/txInstant tma}
       {:db/ident       ::original-id
@@ -385,12 +383,13 @@
                                                                                      :nothing-new-available
                                                                                      :transaction-failed!}]
   (log/spy :trace source-database-name)
-  (let [current-db      (d/db target-conn)
-        last-restored-t (log/spy :trace "last-t" (or
-                                                   (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
-                                                   0))
-        desired-start-t (log/spy :trace "desired-start-t" (if (and last-restored-t (pos? last-restored-t)) (inc last-restored-t) 1))
-        {last-available-start-t :start-t} (log/spy :trace "last-backed-up-t" (dcbp/last-segment-info backup-store source-database-name))]
+  (let [current-db             (d/db target-conn)
+        last-restored-t        (log/spy :trace "last-t" (or
+                                                          (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
+                                                          0))
+        desired-start-t        (log/spy :trace "desired-start-t" (if (and last-restored-t (pos? last-restored-t)) (inc last-restored-t) 1))
+        {last-available-start-t :start-t} (log/spy :trace "last-backed-up-t" (dcbp/last-segment-info backup-store source-database-name))
+        last-available-start-t (if (and last-available-start-t (zero? last-available-start-t)) 1 last-available-start-t)]
     (if (or (nil? last-available-start-t) (< last-available-start-t desired-start-t))
       :nothing-new-available
       (let
