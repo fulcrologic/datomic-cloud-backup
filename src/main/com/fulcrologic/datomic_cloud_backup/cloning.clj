@@ -170,7 +170,7 @@
                   :else @result)))))
         (range starting-segment segments)))))
 
-(>defn normalize-txn
+(>defn rewrite-and-filter-txn
   [{:keys [to-one? id->attr rewrite blacklist]} transaction]
   [(s/keys
      :req-un [::to-one? ::id->attr]
@@ -335,9 +335,12 @@
           (fn [{:keys      [e v added]
                 original-a :a}]
             (let [op (if added :db/add :db/retract)
-                  e  (resolve-id env e)
+                  e  (if (= e tx-id)
+                       "datomic.tx"
+                       (resolve-id env e))
                   a  (resolve-id env original-a)
                   v  (cond
+                       (= v tx-id) "datomic.tx"
                        (and (keyword? a) (= "db" (namespace a)) (int? v)) (resolve-id env v)
                        (= a :db.install/attribute) (str v)
                        (contains? source-refs original-a) (resolve-id env v)
@@ -357,6 +360,28 @@
                   (<= start-t desired-start-t end-t)))
         first
         :start-t))))
+
+(>defn prune-tempids-as-values [target-refs datoms]
+  [(s/coll-of int? :kind set?) (s/coll-of ::txn-op) => (s/coll-of ::txn-op)]
+  (let [tempids-as-e (into #{}
+                       (comp
+                         (filter #(not= :db/cas (first %)))
+                         (map second)
+                         (filter string?))
+                       datoms)
+        ref?         (fn [a] (contains? target-refs a))]
+    (reduce
+      (fn [acc [op e a v :as txnop]]
+        (if (and (not= op :db/cas) (ref? a))
+          (if (or (int? v) (contains? tempids-as-e v))
+            (conj acc txnop)
+            (do
+              (log/warn "Dropped transaction operation" txnop
+                "because v was a tempid that was only used as a value in the transaction:" datoms)
+              acc))
+          (conj acc txnop)))
+      []
+      datoms)))
 
 (>defn restore-segment!
   "Restore the next segment of a backup. Auto-detects (from the target database) where to resume.
@@ -400,21 +425,23 @@
         (log/infof "Restoring %s segment %d starting at %d." source-database-name segment-start-t desired-start-t)
         (doseq [{:keys [t] :as tx-entry} transactions
                 :when (and (> t last-restored-t) (= @result :restored-segment))]
-          (let [db             (d/db target-conn)
-                resolved-txn   (resolved-txn {:db          db
-                                              :id->attr    id->attr
-                                              :source-refs refs} tx-entry)
-                normalized-txn (normalize-txn {:to-one?   (partial to-one? (d/db target-conn))
-                                               :id->attr  id->attr
-                                               :blacklist blacklist
-                                               :rewrite   rewrite} resolved-txn)]
+          (let [db           (d/db target-conn)
+                target-refs  (all-refs db)
+                resolved-txn (resolved-txn {:db          db
+                                            :id->attr    id->attr
+                                            :source-refs refs} tx-entry)
+                pruned-txn   (prune-tempids-as-values target-refs resolved-txn)
+                final-txn    (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
+                                                      :id->attr  id->attr
+                                                      :blacklist blacklist
+                                                      :rewrite   rewrite} pruned-txn)]
             (try
               (log/trace "Current basis time of the database" (inst-ms (tx-time (last (d/tx-range target-conn {:start 0 :limit 1000})))))
               (log/trace "Basis time of the entry" (inst-ms (tx-time tx-entry)))
-              (when (empty? normalized-txn)
+              (when (empty? final-txn)
                 (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
-              (log/debug "Transaction:" normalized-txn)
-              (d/transact target-conn {:tx-data normalized-txn
+              (log/debug "Transaction:" final-txn)
+              (d/transact target-conn {:tx-data final-txn
                                        :timeout 10000000})
               (reset! result :restored-segment)
               (catch Exception e
@@ -425,7 +452,7 @@
                      :message     (ex-message e)
                      :data        (ex-data e)
                      :t           t
-                     :transaction normalized-txn}))))))
+                     :transaction final-txn}))))))
         @result))))
 
 (defn backup-gaps
@@ -472,4 +499,4 @@
 
 
 (comment
-  (taoensso.timbre/set-level! :info))
+  (taoensso.timbre/set-level! :warn))

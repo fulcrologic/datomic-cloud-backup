@@ -36,7 +36,10 @@
       (.delete backup-file))))
 
 (def sample-schema
-  [{:db/ident       :person/id
+  [{:db/ident       :transaction/reason
+    :db/valueType   :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident       :person/id
     :db/valueType   :db.type/uuid
     :db/unique      :db.unique/identity
     :db/cardinality :db.cardinality/one}
@@ -59,7 +62,9 @@
         person-id      (UUID/randomUUID)
         address-id     (UUID/randomUUID)
         txns           [sample-schema
-                        [{:db/id          "BOB"
+                        [[:db/add "BAD-DATOM" :person/address 4872362574]
+                         [:db/add "datomic.tx" :transaction/reason "Because"]
+                         {:db/id          "BOB"
                           :person/id      person-id
                           :person/name    "Bob"
                           :person/address {:db/id          "MAIN"
@@ -202,7 +207,7 @@
         (d/delete-database client {:db-name db-name})
         (d/delete-database client {:db-name target-db-name})))))
 
-(specification "resolved-txn"
+(specification "resolved-txn" :focus
   (let [db-name        (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
         _              (d/create-database client {:db-name db-name})
@@ -239,42 +244,18 @@
             original-tx-id (-> schema-entry :data first :tx)
             txn            (cloning/resolved-txn {:db          db
                                                   :id->attr    id->attr
-                                                  :source-refs source-refs} schema-entry)]
+                                                  :source-refs source-refs} schema-entry)
+            txn-set        (set txn)]
         (component "When dealing with early schema"
           (assertions
             "Adds original IDs to user schema attributes"
-            (subvec txn 1 7) => [[:db/add "74" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 74]
-                                 [:db/add "77" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 77]
-                                 [:db/add "75" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 75]
-                                 [:db/add "datomic.tx" :com.fulcrologic.datomic-cloud-backup.cloning/original-id original-tx-id]
-                                 [:db/add "76" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 76]
-                                 [:db/add "73" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 73]]
+            (contains? txn-set [:db/add "77" :com.fulcrologic.datomic-cloud-backup.cloning/original-id 77]) => true
             "Rewrites the db id of the txn to datomic.tx"
-            (second (nth txn 7)) => "datomic.tx"
+            (contains? txn-set [:db/add "datomic.tx" :com.fulcrologic.datomic-cloud-backup.cloning/original-id original-tx-id]) => true
             "Rewrites the :db/id of the new items to strings that match the original ids"
-            (subvec txn 8 24) => [[:db/add "73" :db/ident :person/id]
-                                  [:db/add "73" :db/valueType :db.type/uuid]
-                                  [:db/add "73" :db/unique :db.unique/identity]
-                                  [:db/add "73" :db/cardinality :db.cardinality/one]
-                                  [:db/add "74" :db/ident :person/name]
-                                  [:db/add "74" :db/valueType :db.type/string]
-                                  [:db/add "74" :db/cardinality :db.cardinality/one]
-                                  [:db/add "75" :db/ident :address/id]
-                                  [:db/add "75" :db/valueType :db.type/uuid]
-                                  [:db/add "75" :db/cardinality :db.cardinality/one]
-                                  [:db/add "76" :db/ident :address/street]
-                                  [:db/add "76" :db/valueType :db.type/string]
-                                  [:db/add "76" :db/cardinality :db.cardinality/one]
-                                  [:db/add "77" :db/ident :person/address]
-                                  [:db/add "77" :db/valueType :db.type/ref]
-                                  [:db/add "77" :db/cardinality :db.cardinality/one]]
+            (contains? txn-set [:db/add "74" :db/ident :person/id]) => true
             "Uses the temp ids as the values for install attribute"
-            (subvec txn 24) => [[:db/add :db.part/db :db.install/attribute "73"]
-                                [:db/add :db.part/db :db.install/attribute "74"]
-                                [:db/add :db.part/db :db.install/attribute "75"]
-                                [:db/add :db.part/db :db.install/attribute "76"]
-                                [:db/add :db.part/db :db.install/attribute "77"]]))
-
+            (contains? txn-set [:db/add :db.part/db :db.install/attribute "74"]) => true))
 
         (tx! target-conn sample-schema)
 
@@ -308,8 +289,8 @@
             "Uses real IDs for updating things that are in the database"
             ;; NOTE: The strings for attributes are because we are not doing the actual restore,
             ;; so it cannot find the original IDs
-            (subvec txn 4 6) => [[:db/add NEW-PERSON1 "74" "Bob"]
-                                 [:db/retract NEW-PERSON1 "74" "Joe"]]
+            (subvec txn 4 6) => [[:db/add NEW-PERSON1 "75" "Bob"]
+                                 [:db/retract NEW-PERSON1 "75" "Joe"]]
             "Uses correct tmpid for new entities"
             (map second (subvec txn 6)) => [(str PERSON2) (str PERSON2)])))
 
@@ -317,7 +298,7 @@
         (d/delete-database client {:db-name db-name})
         (d/delete-database client {:db-name target-db-name})))))
 
-(specification "Backup" :focus
+(specification "Backup"
   (component "Using Test Stores (RAM-Based)"
     (run-tests :db1 (new-ram-store)))
   (component "Using Filesystem"
@@ -388,7 +369,7 @@
     => [{:start-t 106 :end-t 110}
         {:start-t 119 :end-t 146}]))
 
-(specification "repair-backup!" :focus
+(specification "repair-backup!"
   (let [db-name        (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
         schema         [{:db/ident       :person/id
