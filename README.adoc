@@ -27,8 +27,8 @@ but no way to actually store a proper incremental backup for business continuity
 
 == Status
 
-This library is under development, and is not yet ready for production use. It is released in the hopes that others
-will find it useful, and perhaps contribute improvements to the ideas.
+This library is in production testing as of Sept 10, 2021. The backup creation seems solid, and the restore process
+has been tested with nearly 100M datoms. Be sure to read the notes section below.
 
 == Usage
 
@@ -125,6 +125,9 @@ it cannot do if you transact something that has a time close to "now".
 * Using an elision predicate on the restore can cause transactions to become empty. Those transactions will be still
 be added to the database so that `last-source-transaction` is updated. This ensures that interrupted restores can be
 properly restarted, and that the basis of every transaction will match the original.
+* If you've been running Datomic Cloud for a while, you probably have upgraded storage and base schema at some point. The
+restore code should handle upgrades fine, but of course if you were to try to restore *to an older* version of a Datomic
+cloud template *from a newer source* it will almost certainly fail.
 
 == License
 
