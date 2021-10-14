@@ -354,12 +354,12 @@
   [store dbname desired-start-t]
   (if (= desired-start-t (:start-t (dcbp/last-segment-info store dbname)))
     desired-start-t
-    (let [saved-segments (dcbp/saved-segment-info store dbname)]
-      (->> saved-segments
-        (filter (fn [{:keys [start-t end-t]}]
-                  (<= start-t desired-start-t end-t)))
-        first
-        :start-t))))
+    (let [saved-segments (dcbp/saved-segment-info store dbname)
+          candidates     (filterv (fn [{:keys [start-t end-t]}]
+                                    (<= start-t desired-start-t end-t))
+                           saved-segments)]
+      (log/spy :info candidates)
+      (-> candidates first :start-t))))
 
 (>defn prune-tempids-as-values [target-refs datoms]
   [(s/coll-of int? :kind set?) (s/coll-of ::txn-op) => (s/coll-of ::txn-op)]
@@ -409,17 +409,21 @@
                                                                                      :transaction-failed!}]
   (log/spy :trace source-database-name)
   (let [current-db             (d/db target-conn)
-        last-restored-t        (or
-                                 (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
-                                 0)
-        desired-start-t        (if (and last-restored-t (pos? last-restored-t)) (inc last-restored-t) 1)
-        {last-available-start-t :start-t} (dcbp/last-segment-info backup-store source-database-name)
-        last-available-start-t (if (and last-available-start-t (zero? last-available-start-t)) 1 last-available-start-t)]
+        last-restored-t        (log/spy :info "last-restored-t"
+                                 (or
+                                   (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
+                                   0))
+        desired-start-t        (log/spy :info "desired-start-t" (if (and (log/spy :info last-restored-t) (pos? last-restored-t)) (inc last-restored-t) 1))
+        {last-available-start-t :start-t} (log/spy :info (dcbp/last-segment-info backup-store source-database-name))
+        last-available-start-t (log/spy :info "next last-available-start-t" (if (and last-available-start-t (zero? last-available-start-t)) 1 last-available-start-t))]
     (if (or (nil? last-available-start-t) (< last-available-start-t desired-start-t))
       :nothing-new-available
       (let
-        [segment-start-t (if (< desired-start-t 2) desired-start-t (find-segment-start-t backup-store source-database-name desired-start-t))
+        [segment-start-t (log/spy :info "segment-start-t" (if (< desired-start-t 2)
+                                                            desired-start-t
+                                                            (find-segment-start-t backup-store source-database-name desired-start-t)))
          {:keys [refs id->attr transactions] :as tgi} (-load-transactions backup-store source-database-name segment-start-t)
+         _               (log/spy :info (count transactions))
          result          (atom :restored-segment)]
         (when (< segment-start-t 2) (ensure-restore-schema! target-conn))
         (log/infof "Restoring %s segment %d starting at %d." source-database-name segment-start-t desired-start-t)
@@ -441,8 +445,9 @@
               (when (empty? final-txn)
                 (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
               (log/debug "Transaction:" final-txn)
-              (d/transact target-conn {:tx-data final-txn
-                                       :timeout 10000000})
+              (log/spy :info final-txn)
+              (log/spy :info (d/transact target-conn {:tx-data final-txn
+                                                      :timeout 10000000}))
               (reset! result :restored-segment)
               (catch Exception e
                 (let [{:db/keys [error]} (ex-data e)]

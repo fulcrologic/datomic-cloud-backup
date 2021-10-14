@@ -150,7 +150,7 @@
     (let [start-t   (if (= 0 start-t)
                       (:start-t (first (dcbp/saved-segment-info this dbname)))
                       start-t)
-          nm        (first (list-objects aws-client bucket-name (artifact-basename dbname start-t)))
+          nm        (last (list-objects aws-client bucket-name (artifact-basename dbname start-t)))
           full-name (str (artifact-basename dbname start-t) nm)]
       (get-compressed-edn aws-client bucket-name full-name)))
   (load-transaction-group
