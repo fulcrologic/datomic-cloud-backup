@@ -19,10 +19,12 @@
     [taoensso.nippy :as nippy]
     [taoensso.timbre :as log])
   (:import
-    [com.amazonaws.services.s3 AmazonS3ClientBuilder AmazonS3]
-    [com.amazonaws.services.s3.model ObjectMetadata S3ObjectSummary]
     (com.amazonaws ClientConfiguration)
-    (java.io ByteArrayOutputStream)))
+    (com.amazonaws.services.s3 AmazonS3ClientBuilder AmazonS3)
+    (com.amazonaws.services.s3.model ObjectMetadata S3ObjectSummary)
+    (com.amazonaws.services.s3.transfer TransferManager TransferManagerBuilder)
+    (java.io InputStream ByteArrayOutputStream OutputStream ByteArrayInputStream File FileOutputStream BufferedOutputStream)
+    (java.util Date)))
 
 (defn aws-credentials? []
   (let [k (System/getenv "AWS_ACCESS_KEY_ID")]
@@ -56,54 +58,33 @@
 
 (defn- put-compressed-edn
   "Compress the given EDN and store it as `key` in the given bucket."
-  [^AmazonS3 aws-client ^String bucket-name key EDN]
+  [^TransferManager transfer ^String bucket-name key EDN]
   (when-not bucket-name
     (throw (ex-info "Cannot write file. No bucket name" {})))
-  (let [byte-array (nippy/freeze EDN)
-        n          (count byte-array)
-        stream     (io/input-stream byte-array)]
-    (.putObject aws-client bucket-name (str key) stream (metadata-with {:content-type   "application/octet-stream"
-                                                                        :content-length n}))))
-
-(defn- get-object [aws-client bucket key]
-  (-> (.getObject aws-client bucket key) .getObjectContent))
-
-(defn- get-stream [aws-client bucket-name key target-output-stream]
-  (let [nm                      key
-        max-delay-seconds       2
-        automatic-fetch-retries 10
-        fetch!                  #(try
-                                   (let [nm key]
-                                     (with-open [in (get-object aws-client bucket-name nm)]
-                                       (io/copy in target-output-stream)
-                                       (.flush target-output-stream))
-                                     true)
-                                   (catch Exception _e false))
-        loop-delay              (int (* 1000.0 (/ (double (max 1 max-delay-seconds)) (double (max 1 automatic-fetch-retries)))))]
-    ;; S3 is eventually consistent. The code would not be asking for this resource if it was expected not to exist,
-    ;; so we try a few times in case it hasn't arrived on s3 yet.
-    (loop [attempt 1
-           result  (fetch!)]
-      (cond
-        (true? result) true
-        (>= attempt automatic-fetch-retries) (do
-                                               (log/error "Giving up after" automatic-fetch-retries "attempts to read" nm)
-                                               false)
-        :else (do
-                (Thread/sleep loop-delay)
-                (recur (inc attempt) (fetch!)))))))
+  (let [tempFile (File/createTempFile "txnupload" "nippy")]
+    (try
+      (let [_      (nippy/freeze-to-file tempFile EDN)
+            upload (.upload transfer bucket-name (str key) tempFile)]
+        (.waitForCompletion upload))
+      (catch Throwable t
+        (log/error t "Unable to upload EDN" key))
+      (finally
+        (.delete tempFile)))))
 
 (defn- get-compressed-edn
   "Get a nippy-compressed object from s3 and decompress it back to EDN."
-  [^AmazonS3 aws-client ^String bucket-name ^String resource-name]
-  (try
-    (let [baos (ByteArrayOutputStream.)
-          _    (get-stream aws-client bucket-name resource-name baos)
-          edn  (nippy/thaw (.toByteArray baos))]
-      edn)
-    (catch Exception e
-      (log/error e "Thaw failed.")
-      nil)))
+  [^TransferManager transfer ^String bucket-name ^String resource-name]
+  (let [tempFile (File/createTempFile "txns" "nippy")]
+    (try
+      (let [download (.download transfer bucket-name resource-name tempFile)
+            _        (.waitForCompletion download)
+            edn      (nippy/thaw-from-file tempFile)]
+        edn)
+      (catch Exception e
+        (log/error e "Thaw failed.")
+        nil)
+      (finally
+        (.delete tempFile)))))
 
 (defn- list-objects
   "List all of the objects in the given bucket that have the given prefix"
@@ -122,12 +103,12 @@
 (defn- artifact-name [dbname start-t end-t] (format "/%s/%d/%d/transaction-group.nippy" (name dbname) start-t end-t))
 (defn- last-saved-segment-name [dbname] (format "/%s/last-segment.nippy" (name dbname)))
 
-(deftype S3BackupStore [^AmazonS3 aws-client ^String bucket-name]
+(deftype S3BackupStore [^AmazonS3 aws-client ^TransferManager transfer ^String bucket-name]
   dcbp/BackupStore
   (last-segment-info [this dbname]
     (let [object-name (last-saved-segment-name dbname)
           data        (when (aws-object-exists? aws-client bucket-name object-name)
-                        (get-compressed-edn aws-client bucket-name object-name))]
+                        (get-compressed-edn transfer bucket-name object-name))]
       (if data
         data
         (last (dcbp/saved-segment-info this dbname)))))
@@ -143,8 +124,8 @@
   (save-transactions! [_ dbname transaction-group]
     (let [{:keys [start-t end-t]} transaction-group
           nm (artifact-name dbname start-t end-t)]
-      (put-compressed-edn aws-client bucket-name nm transaction-group)
-      (put-compressed-edn aws-client bucket-name (last-saved-segment-name dbname) {:start-t start-t :end-t end-t})))
+      (put-compressed-edn transfer bucket-name nm transaction-group)
+      (put-compressed-edn transfer bucket-name (last-saved-segment-name dbname) {:start-t start-t :end-t end-t})))
   (load-transaction-group
     [this dbname start-t]
     (let [start-t   (if (= 0 start-t)
@@ -152,14 +133,14 @@
                       start-t)
           nm        (first (list-objects aws-client bucket-name (artifact-basename dbname start-t)))
           full-name (str (artifact-basename dbname start-t) nm)]
-      (get-compressed-edn aws-client bucket-name full-name)))
+      (get-compressed-edn transfer bucket-name full-name)))
   (load-transaction-group
     [_ dbname start-t end-t]
     (let [full-name (artifact-name dbname start-t end-t)]
-      (get-compressed-edn aws-client bucket-name full-name))))
+      (get-compressed-edn transfer bucket-name full-name))))
 
 (defn new-s3-store
   ([bucket s3-options]
-   (->S3BackupStore (new-s3-client s3-options) bucket))
+   (->S3BackupStore (new-s3-client s3-options) (TransferManagerBuilder/defaultTransferManager) bucket))
   ([bucket]
    (new-s3-store bucket {})))

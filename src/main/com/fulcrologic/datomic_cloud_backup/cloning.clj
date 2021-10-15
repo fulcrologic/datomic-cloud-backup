@@ -392,6 +392,7 @@
   * :nothing-new-available - The backup is restored to the current end. There was nothing to do.
   * :transaction-failed! - The restore tried to restore data, but something went wrong. Check the logs. MAY work
     if re-attempted (e.g. if it was a temporary Datomic outage)
+  * :partial-segment - The restore found a segment that was supposed to have more data in it than it really had.
 
   The arguments are:
 
@@ -407,7 +408,6 @@
   [::db-name ::connection ::dcbp/store (s/keys :opt-un [::blacklist ::rewrite]) => #{:restored-segment
                                                                                      :nothing-new-available
                                                                                      :transaction-failed!}]
-  (log/spy :trace source-database-name)
   (let [current-db             (d/db target-conn)
         last-restored-t        (or
                                  (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
@@ -423,29 +423,32 @@
          result          (atom :restored-segment)]
         (when (< segment-start-t 2) (ensure-restore-schema! target-conn))
         (log/infof "Restoring %s segment %d starting at %d." source-database-name segment-start-t desired-start-t)
-        (doseq [{:keys [t] :as tx-entry} transactions
-                :when (and (> t last-restored-t) (= @result :restored-segment))]
-          (let [db           (d/db target-conn)
-                target-refs  (all-refs db)
-                resolved-txn (resolved-txn {:db          db
-                                            :id->attr    id->attr
-                                            :source-refs refs} tx-entry)
-                pruned-txn   (prune-tempids-as-values target-refs resolved-txn)
-                final-txn    (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
-                                                      :id->attr  id->attr
-                                                      :blacklist blacklist
-                                                      :rewrite   rewrite} pruned-txn)]
-            (try
-              (log/trace "Current basis time of the database" (inst-ms (tx-time (last (d/tx-range target-conn {:start 0 :limit 1000})))))
-              (log/trace "Basis time of the entry" (inst-ms (tx-time tx-entry)))
-              (when (empty? final-txn)
-                (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
-              (log/debug "Transaction:" final-txn)
-              (d/transact target-conn {:tx-data final-txn
-                                       :timeout 10000000})
-              (reset! result :restored-segment)
-              (catch Exception e
-                (let [{:db/keys [error]} (ex-data e)]
+        (log/infof "There are %d transactions in the segment found." (count transactions))
+        (if (<= (+ segment-start-t (count transactions)) desired-start-t)
+          (do
+            (log/error "Transaction group does NOT have the starting point needed!")
+            :partial-segment)
+          (doseq [{:keys [t] :as tx-entry} transactions
+                  :when (and (> t last-restored-t) (= @result :restored-segment))]
+            (let [db           (d/db target-conn)
+                  target-refs  (all-refs db)
+                  resolved-txn (resolved-txn {:db          db
+                                              :id->attr    id->attr
+                                              :source-refs refs} tx-entry)
+                  pruned-txn   (prune-tempids-as-values target-refs resolved-txn)
+                  final-txn    (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
+                                                        :id->attr  id->attr
+                                                        :blacklist blacklist
+                                                        :rewrite   rewrite} pruned-txn)]
+              (try
+                (when (empty? final-txn)
+                  (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
+                (log/debug "Committing transaction" t)
+                (d/transact target-conn {:tx-data final-txn
+                                         :timeout 10000000})
+                (log/debug "Finished transaction" t)
+                (reset! result :restored-segment)
+                (catch Throwable e
                   (reset! result :transaction-failed!)
                   (log/error e "Restore transaction failed!"
                     {:db          source-database-name
@@ -496,7 +499,3 @@
       (doseq [{:keys [start-t end-t] :as gap} gaps]
         (log/infof "Found gap %s. Backing it up." gap)
         (backup-segment! dbname conn db-store start-t end-t)))))
-
-
-(comment
-  (taoensso.timbre/set-level! :warn))
