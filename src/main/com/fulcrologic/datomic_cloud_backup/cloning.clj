@@ -144,30 +144,33 @@
                                    parallel?        true}}]
   (let [db       (d/db connection)
         Map      (if parallel? pmap map)
-        segments (inc (int (/ (:t db) txns-per-segment)))]
+        segments (inc (int (/ (:t db) txns-per-segment)))
+        failed?  (atom false)]
     (doall
       (Map
         (fn [segment-number]
-          (let [start (* segment-number txns-per-segment)
-                end   (+ start txns-per-segment)]
-            (loop [attempt 0]
-              (let [ok?    (atom false)
-                    result (atom nil)]
-                (try
-                  (reset! result (backup-segment! dbname connection store start end))
-                  (reset! ok? true)
-                  (catch Exception e
-                    (log/warn e "Backup step failed. Retrying" attempt)))
-                (cond
-                  (> attempt 10) (do
-                                   (log/error "BACKUP FAILED. Too many attempts on segment" segment-number [start end])
-                                   (throw (ex-info "BACKUP FAILED." {:segment-number segment-number
-                                                                     :start-t        start
-                                                                     :end-t          end})))
-                  (not @ok?) (do
-                               (Thread/sleep 1000)
-                               (recur (inc attempt)))
-                  :else @result)))))
+          (when-not @failed?
+            (let [start (* segment-number txns-per-segment)
+                  end   (+ start txns-per-segment)]
+              (loop [attempt 0]
+                (let [ok?    (atom false)
+                      result (atom nil)]
+                  (try
+                    (reset! result (backup-segment! dbname connection store start end))
+                    (reset! ok? true)
+                    (catch Exception e
+                      (log/warn e "Backup step failed. Retrying" attempt)))
+                  (cond
+                    (> attempt 10) (do
+                                     (reset! failed? true)
+                                     (log/error "BACKUP FAILED. Too many attempts on segment" segment-number [start end])
+                                     (throw (ex-info "BACKUP FAILED." {:segment-number segment-number
+                                                                       :start-t        start
+                                                                       :end-t          end})))
+                    (not @ok?) (do
+                                 (Thread/sleep 1000)
+                                 (recur (inc attempt)))
+                    :else @result))))))
         (range starting-segment segments)))))
 
 (>defn rewrite-and-filter-txn
