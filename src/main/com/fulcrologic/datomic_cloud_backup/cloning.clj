@@ -161,7 +161,7 @@
                     (catch Exception e
                       (log/warn e "Backup step failed. Retrying" attempt)))
                   (cond
-                    (> attempt 10) (do
+                    (> attempt 2) (do
                                      (reset! failed? true)
                                      (log/error "BACKUP FAILED. Too many attempts on segment" segment-number [start end])
                                      (throw (ex-info "BACKUP FAILED." {:segment-number segment-number
