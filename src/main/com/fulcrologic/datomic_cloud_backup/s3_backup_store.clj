@@ -141,6 +141,10 @@
 
 (defn new-s3-store
   ([bucket s3-options]
-   (->S3BackupStore (new-s3-client s3-options) (TransferManagerBuilder/defaultTransferManager) bucket))
+   (let [client   (new-s3-client s3-options)
+         transfer (-> (TransferManagerBuilder/standard)
+                    (.withS3Client client)
+                    (.build))]
+     (->S3BackupStore client transfer bucket)))
   ([bucket]
    (new-s3-store bucket {})))
