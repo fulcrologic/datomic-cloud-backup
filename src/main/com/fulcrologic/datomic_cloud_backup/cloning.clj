@@ -162,11 +162,11 @@
                       (log/warn e "Backup step failed. Retrying" attempt)))
                   (cond
                     (> attempt 2) (do
-                                     (reset! failed? true)
-                                     (log/error "BACKUP FAILED. Too many attempts on segment" segment-number [start end])
-                                     (throw (ex-info "BACKUP FAILED." {:segment-number segment-number
-                                                                       :start-t        start
-                                                                       :end-t          end})))
+                                    (reset! failed? true)
+                                    (log/error "BACKUP FAILED. Too many attempts on segment" segment-number [start end])
+                                    (throw (ex-info "BACKUP FAILED." {:segment-number segment-number
+                                                                      :start-t        start
+                                                                      :end-t          end})))
                     (not @ok?) (do
                                  (Thread/sleep 1000)
                                  (recur (inc attempt)))
@@ -454,11 +454,10 @@
                 (catch Throwable e
                   (reset! result :transaction-failed!)
                   (log/error e "Restore transaction failed!"
-                    {:db          source-database-name
-                     :message     (ex-message e)
-                     :data        (ex-data e)
-                     :t           t
-                     :transaction final-txn}))))))
+                    {:db      source-database-name
+                     :message (ex-message e)
+                     :data    (ex-data e)
+                     :t       t}))))))
         @result))))
 
 (defn backup-gaps
