@@ -2,6 +2,7 @@
   "Copy a database with history via transaction logs. Based on code from Cognitect."
   (:require
     [com.fulcrologic.guardrails.core :refer [>defn => ?]]
+    [clojure.core.async :as async]
     [clojure.pprint :refer [pprint]]
     [clojure.set :as set]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
@@ -459,6 +460,104 @@
                      :data    (ex-data e)
                      :t       t}))))))
         @result))))
+
+(>defn restore!!
+  "Restore as much of the database as possible. This is an interruptible call (you can reboot and nothing will be
+   harmed). This function does as much pipelining and optimization as possible to try to restore the database
+   as quickly as possible. You should check DynamoDB write provisioning to make sure it is not throttling writes,
+   and make sure you're using a large enough node that you are not CPU bound.
+
+   This function can run for a *very* long time, depending on database size (days or even weeks).
+
+   See `restore-segment!` for a slower version that returns after each segment is restored.
+
+   The arguments are:
+
+   * source-database-name - The name used for this backup.
+   * target-conn - The connection of the target db on which to restore.
+   * backup-store - A durable store that was used to save the database
+   * options - A map of other options
+   ** :blacklist - A set of keywords (attributes) to elide from all transactions.
+   ** :rewrite - A map from attribute keyword to a `(fn [attr value] new-value)` that can be used to obfuscate the original value to a new one.
+   "
+  [source-database-name target-conn backup-store {:keys [blacklist rewrite]
+                                                  :or   {blacklist #{}}}]
+  [::db-name ::connection ::dcbp/store (s/keys :opt-un [::blacklist ::rewrite]) => #{:restored-segment
+                                                                                     :nothing-new-available
+                                                                                     :transaction-failed!}]
+  (let [current-db                 (d/db target-conn)
+        last-restored-t            (or
+                                     (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
+                                     0)
+        desired-start-t            (if (and last-restored-t (pos? last-restored-t)) (inc last-restored-t) 1)
+        all-segment-info           (sort-by :start-t (dcbp/saved-segment-info backup-store source-database-name))
+        segments-remaining         (filter (fn [{:keys [start-t end-t]}]
+                                             (or
+                                               (> start-t desired-start-t)
+                                               (<= start-t desired-start-t end-t)))
+                                     all-segment-info)
+        transaction-source-channel (async/chan 10)]
+    (try
+      (when (< desired-start-t 2) (ensure-restore-schema! target-conn))
+      (async/go-loop [segment-info (first segments-remaining)
+                      remainder (rest segments-remaining)]
+        (let [{:keys [start-t end-t]} segment-info
+              group-result-channel (async/thread
+                                     (try
+                                       (log/info "Pre-loading group" start-t end-t)
+                                       (dcbp/load-transaction-group backup-store source-database-name start-t end-t)
+                                       (catch Throwable t
+                                         (log/error t "Failed to load transaction group")
+                                         {:failed? true})))]
+          (async/>! transaction-source-channel group-result-channel))
+        (if (seq remainder)
+          (recur (first remainder) (rest remainder))
+          (async/close! transaction-source-channel)))
+      ;; Aggressively load the segments from the backup store in advance of restore to make sure writes are not blocked
+      ;; by reading the groups
+      (loop [expected-start-t (:start-t (first segments-remaining))]
+        (let [{:keys [refs id->attr transactions start-t end-t failed?] :as tgi} (some-> transaction-source-channel
+                                                                                   ;; Get the thread's channel
+                                                                                   (async/<!!)
+                                                                                   ;; Get the thread's result
+                                                                                   (async/<!!))
+              current-db      (d/db target-conn)
+              last-restored-t (or
+                                (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
+                                0)]
+          (cond
+            (and start-t (not= start-t expected-start-t))
+            #_=> {:error (format "Segments misaligned. Expected to start at %d but found %d" expected-start-t start-t)}
+            (and tgi (not failed?))
+            #_=> (do
+                   (log/info "Restoring transactions from" start-t "to" end-t)
+                   (doseq [{:keys [t] :as tx-entry} transactions
+                           :when (and (> t last-restored-t))]
+                     (let [db           (d/db target-conn)
+                           target-refs  (all-refs db)
+                           resolved-txn (resolved-txn {:db          db
+                                                       :id->attr    id->attr
+                                                       :source-refs refs} tx-entry)
+                           pruned-txn   (prune-tempids-as-values target-refs resolved-txn)
+                           final-txn    (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
+                                                                 :id->attr  id->attr
+                                                                 :blacklist blacklist
+                                                                 :rewrite   rewrite} pruned-txn)]
+                       (try
+                         (when (empty? final-txn)
+                           (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
+                         (d/transact target-conn {:tx-data final-txn
+                                                  :timeout 10000000})
+                         (catch Throwable e
+                           (log/error e "Restore transaction failed!"
+                             {:db      source-database-name
+                              :message (ex-message e)
+                              :data    (ex-data e)
+                              :t       t})))))
+                   (recur (inc end-t)))
+            :else {:result (str "No more segments to restore. Was looking for the next start: " expected-start-t)})))
+      (finally
+        (async/close! transaction-source-channel)))))
 
 (defn backup-gaps
   "Looks for gaps in the given segments (maps of :start-t and :end-t inclusive, which is what the db store's

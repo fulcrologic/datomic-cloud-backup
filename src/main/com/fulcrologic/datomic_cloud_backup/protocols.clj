@@ -20,10 +20,13 @@
      it is trusted (and can cause failures if it is wrong), but if not supplied it will be derived from the first segment
      found that has `start-t`. The return value is a map containing:
 
-      `:info` - Information about the database at the time of the backup (e.g. existing schema)
-      `:start-t` - The original transaction number that this group started at.
-      `:end-t` - The original transaction number that this group ended at (inclusive).
-      `:transactions` - The original data saved via `save-transaction!`.
+     ```
+     {:refs         #{...} ; set of all attribute keys that have a ref type
+      :id->attr     {id :k} ; map from :db/id in original database to db ident keyword
+      :transactions [...] ; sequence of transactions from the log
+      :start-t      actual-start ; starting t of the transactions in this group
+      :end-t        actual-end}  ; final t of the transactions in this group
+     ```
 
       ONLY returns a transaction group if `start-t` (and, if supplied, end-t) is/are EXACTLY right. The next desirable transaction group is always
       `(inc end-t)` of the prior one. Transaction groups can vary in size, so do not assume you can guess this value.
