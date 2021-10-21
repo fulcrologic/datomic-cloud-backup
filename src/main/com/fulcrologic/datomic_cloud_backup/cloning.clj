@@ -10,6 +10,7 @@
     [datomic.client.api.protocols :as dp]
     [taoensso.timbre :as log]
     [taoensso.truss :refer [have]]
+    [taoensso.tufte :as tufte :refer [profile p]]
     [clojure.spec.alpha :as s])
   (:import (clojure.lang ExceptionInfo)
            (java.util Date)))
@@ -42,12 +43,13 @@
   "Return a set of all :db.type/ref entity IDs from the provided DB"
   [db]
   [::db => (s/every int? :kind set?)]
-  (into #{}
-    (map first
-      (d/q '[:find ?e
-             :in $
-             :where
-             [?e :db/valueType :db.type/ref]] db))))
+  (p `all-refs
+    (into #{}
+      (map first
+        (d/q '[:find ?e
+               :in $
+               :where
+               [?e :db/valueType :db.type/ref]] db)))))
 
 (>defn datom->map
   [{:keys [e a v tx added]}]
@@ -180,29 +182,30 @@
      :req-un [::to-one? ::id->attr]
      :opt-un [::rewrite ::blacklist])
    (s/coll-of ::txn-op :kind vector?) => (s/coll-of ::txn-op :kind vector?)]
-  (->> transaction
-    (sort-by #(not= :db/add (first %)))
-    (reduce
-      (fn [{:keys [adds] :as acc} [op e a v :as original]]
-        (let [added    (= :db/add op)
-              v        (if-let [rewrite (and added (get rewrite a))]
-                         (rewrite a v)
-                         v)
-              retract? (= :db/retract op)
-              noop?    (and retract? (contains? adds a) to-one? (to-one? a))]
-          ;; This is necessary because rewrite can cause the add/retract to match, which will cause
-          ;; a datom conflict.
-          (cond
-            noop? acc
-            added (-> acc
-                    (update :adds conj a)
-                    (update :result conj [op e a v]))
-            retract? (update acc :result conj [op e a v])
-            :else (update acc :result conj original))))
-      {:adds #{} :result []})
-    :result
-    (remove #(contains? blacklist (nth % 2)))
-    vec))
+  (p `rewrite-and-filter-txn
+    (->> transaction
+      (sort-by #(not= :db/add (first %)))
+      (reduce
+        (fn [{:keys [adds] :as acc} [op e a v :as original]]
+          (let [added    (= :db/add op)
+                v        (if-let [rewrite (and added (get rewrite a))]
+                           (rewrite a v)
+                           v)
+                retract? (= :db/retract op)
+                noop?    (and retract? (contains? adds a) to-one? (to-one? a))]
+            ;; This is necessary because rewrite can cause the add/retract to match, which will cause
+            ;; a datom conflict.
+            (cond
+              noop? acc
+              added (-> acc
+                      (update :adds conj a)
+                      (update :result conj [op e a v]))
+              retract? (update acc :result conj [op e a v])
+              :else (update acc :result conj original))))
+        {:adds #{} :result []})
+      :result
+      (remove #(contains? blacklist (nth % 2)))
+      vec)))
 
 (>defn tx-time
   "Returns the transaction time of an entry from a tx-entry."
@@ -271,21 +274,23 @@
         (d/transact connection {:tx-data txn})))
     true))
 
+;; TODO: Put an LRU cache on this. It is the hot spot for restore speed
 (>defn resolve-id
   "Finds the new database's :db/id for the given :db/id, or returns a stringified version of the ID for use as a new
    tempid."
   [{:keys [db tx-id id->attr]} old-id]
   [(s/keys :ref-un [::db ::tx-id ::id->attr]) int? => ::e]
-  (let [old-id (get id->attr old-id old-id)]
-    (cond
-      (= tx-id old-id) "datomic.tx"
-      (keyword? old-id) old-id
-      :else (or
-              (-> (d/datoms db {:index      :avet
-                                :components [::original-id old-id]})
-                first
-                :e)
-              (str old-id)))))
+  (p `resolve-id
+    (let [old-id (get id->attr old-id old-id)]
+      (cond
+        (= tx-id old-id) "datomic.tx"
+        (keyword? old-id) old-id
+        :else (or
+                (-> (d/datoms db {:index      :avet
+                                  :components [::original-id old-id]})
+                  first
+                  :e)
+                (str old-id))))))
 
 (>defn bookkeeping-txn
   "Generates a transaction that includes a CAS that verifies the current basis t of the database is the intended
@@ -294,22 +299,23 @@
    original ID during ID resolution."
   [{:keys [db] :as env} {:keys [t data]}]
   [(s/keys :req-un [::db]) ::txn => (s/coll-of ::txn-op :kind vector?)]
-  (let [unique-ids                   (into #{} (map :e) (vec data))
-        current-t                    (ffirst (d/q '[:find ?t :where [::last-source-transaction ::last-source-transaction ?t]] db))
-        tx-id                        (-> data first :tx)
-        env                          (assoc env :tx-id tx-id)
-        ensure-restoring-correct-txn [:db/cas ::last-source-transaction ::last-source-transaction
-                                      (if (zero? current-t) 0 (dec t)) t]]
-    (reduce
-      (fn [acc id]
-        (let [resolved-id (if (= id tx-id)
-                            "datomic.tx"
-                            (resolve-id env id))]
-          (if (string? resolved-id)
-            (conj acc [:db/add resolved-id ::original-id id])
-            acc)))
-      [ensure-restoring-correct-txn]
-      unique-ids)))
+  (p `bookkeeping-txn
+    (let [unique-ids                   (into #{} (map :e) (vec data))
+          current-t                    (p ::current-t (ffirst (d/q '[:find ?t :where [::last-source-transaction ::last-source-transaction ?t]] db)))
+          tx-id                        (-> data first :tx)
+          env                          (assoc env :tx-id tx-id)
+          ensure-restoring-correct-txn [:db/cas ::last-source-transaction ::last-source-transaction
+                                        (if (zero? current-t) 0 (dec t)) t]]
+      (reduce
+        (fn [acc id]
+          (let [resolved-id (if (= id tx-id)
+                              "datomic.tx"
+                              (resolve-id env id))]
+            (if (string? resolved-id)
+              (conj acc [:db/add resolved-id ::original-id id])
+              acc)))
+        [ensure-restoring-correct-txn]
+        unique-ids))))
 
 (>defn resolved-txn
   "This function rewrites an incoming transaction log `tx-entry` into
@@ -325,32 +331,33 @@
    "
   [{:keys [db id->attr source-refs] :as env} {:keys [t data] :as tx-entry}]
   [(s/keys :req-un [::db ::id->attr ::source-refs]) ::txn => (s/coll-of ::txn-op :kind vector?)]
-  (let [tx-id (-> data first :tx)
-        tm    (tx-time tx-entry)
-        env   (assoc env :tx-id tx-id)]
-    (if (< (compare tm #inst "2000-01-01") 0)
-      ;; Record that we has an empty transaction. The timestamp here is a bit of a pain, since I'm just
-      ;; guessing...but it looks like datomic internals set their timestamp to the UNIX epoch
-      (let [tx-time (Date. (long (+ t (inst-ms #inst "1970-01-02"))))]
-        [[:db/cas ::last-source-transaction ::last-source-transaction (dec t) t]
-         [:db/add "datomic.tx" :db/txInstant tx-time]])
-      (into (bookkeeping-txn env tx-entry)
-        (map
-          (fn [{:keys      [e v added]
-                original-a :a}]
-            (let [op (if added :db/add :db/retract)
-                  e  (if (= e tx-id)
-                       "datomic.tx"
-                       (resolve-id env e))
-                  a  (resolve-id env original-a)
-                  v  (cond
-                       (= v tx-id) "datomic.tx"
-                       (and (keyword? a) (= "db" (namespace a)) (int? v)) (resolve-id env v)
-                       (= a :db.install/attribute) (str v)
-                       (contains? source-refs original-a) (resolve-id env v)
-                       :else v)]
-              [op e a v])))
-        data))))
+  (p `resolved-txn
+    (let [tx-id (-> data first :tx)
+          tm    (tx-time tx-entry)
+          env   (assoc env :tx-id tx-id)]
+      (if (< (compare tm #inst "2000-01-01") 0)
+        ;; Record that we has an empty transaction. The timestamp here is a bit of a pain, since I'm just
+        ;; guessing...but it looks like datomic internals set their timestamp to the UNIX epoch
+        (let [tx-time (Date. (long (+ t (inst-ms #inst "1970-01-02"))))]
+          [[:db/cas ::last-source-transaction ::last-source-transaction (dec t) t]
+           [:db/add "datomic.tx" :db/txInstant tx-time]])
+        (into (bookkeeping-txn env tx-entry)
+          (map
+            (fn [{:keys      [e v added]
+                  original-a :a}]
+              (let [op (if added :db/add :db/retract)
+                    e  (if (= e tx-id)
+                         "datomic.tx"
+                         (resolve-id env e))
+                    a  (resolve-id env original-a)
+                    v  (cond
+                         (= v tx-id) "datomic.tx"
+                         (and (keyword? a) (= "db" (namespace a)) (int? v)) (resolve-id env v)
+                         (= a :db.install/attribute) (str v)
+                         (contains? source-refs original-a) (resolve-id env v)
+                         :else v)]
+                [op e a v])))
+          data)))))
 
 (defn find-segment-start-t
   "When resuming a backup the last t in the database won't likely be on a segment boundary. This scans the real segments
@@ -367,25 +374,26 @@
 
 (>defn prune-tempids-as-values [target-refs datoms]
   [(s/coll-of int? :kind set?) (s/coll-of ::txn-op) => (s/coll-of ::txn-op)]
-  (let [tempids-as-e (into #{}
-                       (comp
-                         (filter #(not= :db/cas (first %)))
-                         (map second)
-                         (filter string?))
-                       datoms)
-        ref?         (fn [a] (contains? target-refs a))]
-    (reduce
-      (fn [acc [op e a v :as txnop]]
-        (if (and (not= op :db/cas) (ref? a))
-          (if (or (int? v) (contains? tempids-as-e v))
-            (conj acc txnop)
-            (do
-              (log/warn "Dropped transaction operation" txnop
-                "because v was a tempid that was only used as a value in the transaction:" datoms)
-              acc))
-          (conj acc txnop)))
-      []
-      datoms)))
+  (p `prune-tempids-as-values
+    (let [tempids-as-e (into #{}
+                         (comp
+                           (filter #(not= :db/cas (first %)))
+                           (map second)
+                           (filter string?))
+                         datoms)
+          ref?         (fn [a] (contains? target-refs a))]
+      (reduce
+        (fn [acc [op e a v :as txnop]]
+          (if (and (not= op :db/cas) (ref? a))
+            (if (or (int? v) (contains? tempids-as-e v))
+              (conj acc txnop)
+              (do
+                (log/warn "Dropped transaction operation" txnop
+                  "because v was a tempid that was only used as a value in the transaction:" datoms)
+                acc))
+            (conj acc txnop)))
+        []
+        datoms))))
 
 (>defn restore-segment!
   "Restore the next segment of a backup. Auto-detects (from the target database) where to resume.
@@ -522,38 +530,41 @@
                                                                                    ;; Get the thread's result
                                                                                    (async/<!!))
               current-db      (d/db target-conn)
-              last-restored-t (or
-                                (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
-                                0)]
+              last-restored-t (p ::last-source-transaction
+                                (or
+                                  (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
+                                  0))]
           (cond
             (and start-t (not= start-t expected-start-t))
             #_=> {:error (format "Segments misaligned. Expected to start at %d but found %d" expected-start-t start-t)}
             (and tgi (not failed?))
             #_=> (do
                    (log/info "Restoring transactions from" start-t "to" end-t)
-                   (doseq [{:keys [t] :as tx-entry} transactions
-                           :when (and (> t last-restored-t))]
-                     (let [db           (d/db target-conn)
-                           target-refs  (all-refs db)
-                           resolved-txn (resolved-txn {:db          db
-                                                       :id->attr    id->attr
-                                                       :source-refs refs} tx-entry)
-                           pruned-txn   (prune-tempids-as-values target-refs resolved-txn)
-                           final-txn    (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
-                                                                 :id->attr  id->attr
-                                                                 :blacklist blacklist
-                                                                 :rewrite   rewrite} pruned-txn)]
-                       (try
-                         (when (empty? final-txn)
-                           (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
-                         (d/transact target-conn {:tx-data final-txn
-                                                  :timeout 10000000})
-                         (catch Throwable e
-                           (log/error e "Restore transaction failed!"
-                             {:db      source-database-name
-                              :message (ex-message e)
-                              :data    (ex-data e)
-                              :t       t})))))
+                   (profile {}
+                     (doseq [{:keys [t] :as tx-entry} transactions
+                             :when (and (> t last-restored-t))]
+                       (let [db           (d/db target-conn)
+                             target-refs  (all-refs db)
+                             resolved-txn (resolved-txn {:db          db
+                                                         :id->attr    id->attr
+                                                         :source-refs refs} tx-entry)
+                             pruned-txn   (prune-tempids-as-values target-refs resolved-txn)
+                             final-txn    (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
+                                                                   :id->attr  id->attr
+                                                                   :blacklist blacklist
+                                                                   :rewrite   rewrite} pruned-txn)]
+                         (try
+                           (when (empty? final-txn)
+                             (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
+                           (p ::run-transaction
+                             (d/transact target-conn {:tx-data final-txn
+                                                      :timeout 10000000}))
+                           (catch Throwable e
+                             (log/error e "Restore transaction failed!"
+                               {:db      source-database-name
+                                :message (ex-message e)
+                                :data    (ex-data e)
+                                :t       t}))))))
                    (recur (inc end-t)))
             :else {:result (str "No more segments to restore. Was looking for the next start: " expected-start-t)})))
       (finally
@@ -600,3 +611,6 @@
       (doseq [{:keys [start-t end-t] :as gap} gaps]
         (log/infof "Found gap %s. Backing it up." gap)
         (backup-segment! dbname conn db-store start-t end-t)))))
+
+(comment
+  (tufte/add-basic-println-handler! {}))

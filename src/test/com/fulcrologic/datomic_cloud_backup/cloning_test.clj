@@ -502,7 +502,7 @@
         (d/transact conn {:tx-data [{:person/id   n
                                      :person/name (str "Bob " n)}]}))
 
-      (cloning/backup! db-name conn store {:txns-per-segment 2
+      (cloning/backup! db-name conn store {:txns-per-segment 10
                                            :parallel?        false})
 
       (let [_           (d/create-database client {:db-name target-db-name})
