@@ -246,7 +246,6 @@
     [[{:db/id        "datomic.tx"
        :db/txInstant tma}
       {:db/ident       ::original-id
-       :db/unique      :db.unique/identity
        :db/cardinality :db.cardinality/one
        :db/valueType   :db.type/long
        :db/doc         "Tracks the original :db/id of the entity in the source database."}
@@ -274,22 +273,22 @@
         (d/transact connection {:tx-data txn})))
     true))
 
-;; TODO: Put an LRU cache on this. It is the hot spot for restore speed
 (>defn resolve-id
   "Finds the new database's :db/id for the given :db/id, or returns a stringified version of the ID for use as a new
    tempid."
   [{:keys [db tx-id id->attr]} old-id]
-  [(s/keys :ref-un [::db ::tx-id ::id->attr]) int? => ::e]
+  [(s/keys :ref-un [::db ::tx-id ::id->attr]) (s/or :id int? :ident keyword?) => ::e]
   (p `resolve-id
     (let [old-id (get id->attr old-id old-id)]
       (cond
         (= tx-id old-id) "datomic.tx"
         (keyword? old-id) old-id
         :else (or
-                (-> (d/datoms db {:index      :avet
-                                  :components [::original-id old-id]})
-                  first
-                  :e)
+                (let [matching-datoms (d/datoms db {:index      :avet
+                                                    :components [::original-id old-id]})]
+                  (when (> (count matching-datoms) 1)
+                    (throw (ex-info "ID Resolution failed! Two entities share the same original ID!" {:original-id old-id})))
+                  (-> matching-datoms first :e))
                 (str old-id))))))
 
 (>defn bookkeeping-txn
@@ -469,7 +468,7 @@
                      :t       t}))))))
         @result))))
 
-(>defn restore!!
+(defn restore!!
   "Restore as much of the database as possible. This is an interruptible call (you can reboot and nothing will be
    harmed). This function does as much pipelining and optimization as possible to try to restore the database
    as quickly as possible. You should check DynamoDB write provisioning to make sure it is not throttling writes,
@@ -490,9 +489,6 @@
    "
   [source-database-name target-conn backup-store {:keys [blacklist rewrite]
                                                   :or   {blacklist #{}}}]
-  [::db-name ::connection ::dcbp/store (s/keys :opt-un [::blacklist ::rewrite]) => #{:restored-segment
-                                                                                     :nothing-new-available
-                                                                                     :transaction-failed!}]
   (let [current-db                 (d/db target-conn)
         last-restored-t            (or
                                      (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
