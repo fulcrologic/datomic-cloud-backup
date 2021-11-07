@@ -22,13 +22,13 @@ image:https://img.shields.io/clojars/v/com.fulcrologic/datomic-cloud-backup.svg[
 
 This small library allows you to incrementally save the transaction log of a Datomic
 cloud database (may also work with on-prem, though there is an official story there).
-Datomic Cloud (at the time of this writing) only has a way to pull data into dev-local,
-but no way to actually store a proper incremental backup for business continuity reasons.
 
 == Status
 
-This library is in production testing as of Sept 10, 2021. The backup creation seems solid, and the restore process
-has been tested with nearly 100M datoms. Be sure to read the notes section below.
+This library is not maintained, and was not usable in the real production
+scenarios we needed, though the approach is technically sound. Use at your own risk. 
+We do not accept issues or pull requests on this repository. We recommend you
+contact the Datomic team for an officially-supported backup/restore solution.
 
 == Usage
 
