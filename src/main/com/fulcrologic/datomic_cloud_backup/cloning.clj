@@ -264,9 +264,10 @@
   (let [db          (d/db connection)
         has-schema? (boolean
                       (first
-                        (d/datoms db {:index      :avet
-                                      :components [:db/ident ::original-id]
-                                      :limit      1})))]
+                        (seq
+                          (d/datoms db {:index      :avet
+                                        :components [:db/ident ::original-id]
+                                        :limit      1}))))]
     (when-not has-schema?
       (log/info "Adding schema to track :db/id remappings.")
       (doseq [txn (tempid-tracking-schema-txns connection)]
@@ -284,8 +285,9 @@
         (= tx-id old-id) "datomic.tx"
         (keyword? old-id) old-id
         :else (or
-                (let [matching-datoms (d/datoms db {:index      :avet
-                                                    :components [::original-id old-id]})]
+                (let [matching-datoms (seq
+                                        (d/datoms db {:index      :avet
+                                                      :components [::original-id old-id]}))]
                   (when (> (count matching-datoms) 1)
                     (throw (ex-info "ID Resolution failed! Two entities share the same original ID!" {:original-id old-id})))
                   (-> matching-datoms first :e))
@@ -333,7 +335,23 @@
   (p `resolved-txn
     (let [tx-id (-> data first :tx)
           tm    (tx-time tx-entry)
-          env   (assoc env :tx-id tx-id)]
+          env   (assoc env :tx-id tx-id)
+          k->id (into {}
+                  (keep
+                    (fn [[eid a k? _tx added? :as datom]]
+                      (when (and added?
+                              (= (id->attr a) :db/ident)
+                              (keyword? k?))
+                        [k? eid])))
+                  data)
+          data  (mapv
+                  (fn [m]
+                    (update m :v (fn [v]
+                                   (if (vector? v)
+                                     (mapv (fn [k] (get k->id k k)) v)
+                                     v))))
+                  (mapify-datoms data))]
+      (log/info "In-transaction schema map:" k->id)
       (if (< (compare tm #inst "2000-01-01") 0)
         ;; Record that we has an empty transaction. The timestamp here is a bit of a pain, since I'm just
         ;; guessing...but it looks like datomic internals set their timestamp to the UNIX epoch

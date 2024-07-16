@@ -176,7 +176,7 @@
       "Leaves keywords alone"
       (cloning/resolve-id {:db (d/db conn)} :x) => :x
       "Rewrites transaction ID number to \"datomic.tx\""
-      (cloning/resolve-id {:db (d/db conn)
+      (cloning/resolve-id {:db    (d/db conn)
                            :tx-id 44} 44) => "datomic.tx"
       "Can find original entities by ::original-id"
       (cloning/resolve-id {:db (d/db conn)} 99) => PERSON1
@@ -251,7 +251,7 @@
         (d/delete-database client {:db-name target-db-name})))))
 
 ;; Flaky test...it passes if run enough times, and fails for poor reasons. No time to rewrite
-(specification "resolved-txn"
+(specification "resolved-txn" :focus
   (let [db-name        (keyword (gensym "db"))
         target-db-name (keyword (gensym "db"))
         _              (d/create-database client {:db-name db-name})
@@ -319,10 +319,14 @@
             "Includes the transaction sequence CAS"
             (ffirst txn) => :db/cas
             "Adds the original ID to the transaction"
-            (second txn) => [:db/add
-                             "datomic.tx"
-                             :com.fulcrologic.datomic-cloud-backup.cloning/original-id
-                             original-tx-id]
+            (first
+              (filter
+                (fn [[_ e]]
+                  (= e "datomic.tx"))
+                txn)) => [:db/add
+                          "datomic.tx"
+                          :com.fulcrologic.datomic-cloud-backup.cloning/original-id
+                          original-tx-id]
             "Adds original IDs to new entities"
             (nth txn 2) => [:db/add
                             (str PERSON2)
