@@ -338,11 +338,11 @@
           env   (assoc env :tx-id tx-id)
           k->id (into {}
                   (keep
-                    (fn [[eid a k? _tx added? :as datom]]
-                      (when (and added?
+                    (fn [{:keys [e a v added]}]
+                      (when (and added
                               (= (id->attr a) :db/ident)
-                              (keyword? k?))
-                        [k? eid])))
+                              (keyword? v))
+                        [v e])))
                   data)
           data  (mapv
                   (fn [m]
