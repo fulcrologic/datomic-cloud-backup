@@ -428,7 +428,10 @@
                               data)
         {data-to-keep  false
          data-for-next true} (group-by
-                               (fn [{:keys [e]}] (contains? tuple-creation-eids e))
+                               (fn [{:keys [e v]}]
+                                 (or
+                                   (contains? tuple-creation-eids e)
+                                   (and (= e 0) (contains? tuple-creation-eids v))))
                                data)]
     [(assoc txn :data data-to-keep) (or data-for-next [])]))
 
