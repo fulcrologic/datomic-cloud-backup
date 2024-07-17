@@ -412,6 +412,26 @@
         []
         datoms))))
 
+
+(defonce ^{:doc "A map from database name -> tx data that should be moved to the next txn"}
+  previous-transaction-carryover
+  (atom {}))
+
+(defn extract-conflicting-tuple-creation
+  [id->attr txn]
+  (let [{:keys [data]} txn
+        tuple-creation-eids (into #{}
+                              (keep
+                                (fn [{:keys [e a]}]
+                                  (when (= (id->attr a) :db/tupleAttrs)
+                                    e)))
+                              data)
+        {data-to-keep  false
+         data-for-next true} (group-by
+                               (fn [{:keys [e]}] (contains? tuple-creation-eids e))
+                               data)]
+    [(assoc txn :data data-to-keep) (or data-for-next [])]))
+
 (>defn restore-segment!
   "Restore the next segment of a backup. Auto-detects (from the target database) where to resume.
 
@@ -459,16 +479,25 @@
             :partial-segment)
           (doseq [{:keys [t] :as tx-entry} transactions
                   :when (and (> t last-restored-t) (= @result :restored-segment))]
-            (let [db           (d/db target-conn)
-                  target-refs  (all-refs db)
-                  resolved-txn (resolved-txn {:db          db
-                                              :id->attr    id->attr
-                                              :source-refs refs} tx-entry)
-                  pruned-txn   (prune-tempids-as-values target-refs resolved-txn)
-                  final-txn    (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
-                                                        :id->attr  id->attr
-                                                        :blacklist blacklist
-                                                        :rewrite   rewrite} pruned-txn)]
+            (let [db             (d/db target-conn)
+                  prior-retained (get @previous-transaction-carryover source-database-name)
+                  [tx-entry datoms-for-next] (extract-conflicting-tuple-creation id->attr tx-entry)
+                  _              (swap! previous-transaction-carryover assoc source-database-name datoms-for-next)
+                  tx-id          (first (keep :tx (:data tx-entry)))
+                  tx-entry       (update tx-entry :data (fn [data]
+                                                          (into data
+                                                            (map
+                                                              (fn [item] (assoc item :tx tx-id)))
+                                                            prior-retained)))
+                  target-refs    (all-refs db)
+                  resolved-txn   (resolved-txn {:db          db
+                                                :id->attr    id->attr
+                                                :source-refs refs} tx-entry)
+                  pruned-txn     (prune-tempids-as-values target-refs resolved-txn)
+                  final-txn      (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
+                                                          :id->attr  id->attr
+                                                          :blacklist blacklist
+                                                          :rewrite   rewrite} pruned-txn)]
               (try
                 (when (empty? final-txn)
                   (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
@@ -557,16 +586,25 @@
                    (profile {}
                      (doseq [{:keys [t] :as tx-entry} transactions
                              :when (and (> t last-restored-t))]
-                       (let [db           (d/db target-conn)
-                             target-refs  (all-refs db)
-                             resolved-txn (resolved-txn {:db          db
-                                                         :id->attr    id->attr
-                                                         :source-refs refs} tx-entry)
-                             pruned-txn   (prune-tempids-as-values target-refs resolved-txn)
-                             final-txn    (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
-                                                                   :id->attr  id->attr
-                                                                   :blacklist blacklist
-                                                                   :rewrite   rewrite} pruned-txn)]
+                       (let [db             (d/db target-conn)
+                             prior-retained (get @previous-transaction-carryover source-database-name)
+                             [tx-entry datoms-for-next] (extract-conflicting-tuple-creation id->attr tx-entry)
+                             _              (swap! previous-transaction-carryover assoc source-database-name datoms-for-next)
+                             tx-id          (first (keep :tx (:data tx-entry)))
+                             tx-entry       (update tx-entry :data (fn [data]
+                                                                     (into data
+                                                                       (map
+                                                                         (fn [item] (assoc item :tx tx-id)))
+                                                                       prior-retained)))
+                             target-refs    (all-refs db)
+                             resolved-txn   (resolved-txn {:db          db
+                                                           :id->attr    id->attr
+                                                           :source-refs refs} tx-entry)
+                             pruned-txn     (prune-tempids-as-values target-refs resolved-txn)
+                             final-txn      (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
+                                                                     :id->attr  id->attr
+                                                                     :blacklist blacklist
+                                                                     :rewrite   rewrite} pruned-txn)]
                          (try
                            (when (empty? final-txn)
                              (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
@@ -627,4 +665,5 @@
         (backup-segment! dbname conn db-store start-t end-t)))))
 
 (comment
+  (/ (* 16 (/ 2e9 6)) (* 1024 1024 1024))
   (tufte/add-basic-println-handler! {}))

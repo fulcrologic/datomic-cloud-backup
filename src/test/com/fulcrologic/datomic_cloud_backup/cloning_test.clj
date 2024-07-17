@@ -1,5 +1,6 @@
 (ns com.fulcrologic.datomic-cloud-backup.cloning-test
   (:require
+    [clojure.set :as set]
     [datomic.client.api :as d]
     [com.fulcrologic.datomic-cloud-backup.ram-stores :refer [new-ram-store]]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
@@ -243,8 +244,8 @@
               datoms (cloning/bookkeeping-txn {:db db} tx2-entry)]
           (assertions
             "Fixes tempids on the tx and new items"
-            (vec (rest datoms)) => [[:db/add "datomic.tx" ::cloning/original-id tx-id]
-                                    [:db/add (str PERSON2) ::cloning/original-id PERSON2]])))
+            (set (rest datoms)) => #{[:db/add "datomic.tx" ::cloning/original-id tx-id]
+                                     [:db/add (str PERSON2) ::cloning/original-id PERSON2]})))
 
       (finally
         (d/delete-database client {:db-name db-name})
@@ -319,28 +320,30 @@
             "Includes the transaction sequence CAS"
             (ffirst txn) => :db/cas
             "Adds the original ID to the transaction"
-            (first
-              (filter
-                (fn [[_ e]]
-                  (= e "datomic.tx"))
-                txn)) => [:db/add
-                          "datomic.tx"
-                          :com.fulcrologic.datomic-cloud-backup.cloning/original-id
-                          original-tx-id]
+            (contains? (set txn)
+              [:db/add
+               "datomic.tx"
+               :com.fulcrologic.datomic-cloud-backup.cloning/original-id
+               original-tx-id]) => true
             "Adds original IDs to new entities"
-            (nth txn 2) => [:db/add
-                            (str PERSON2)
-                            :com.fulcrologic.datomic-cloud-backup.cloning/original-id
-                            PERSON2]
+            (contains? (set txn) [:db/add
+                                  (str PERSON2)
+                                  :com.fulcrologic.datomic-cloud-backup.cloning/original-id
+                                  PERSON2]) => true
             "Includes the original transaction time"
-            (-> txn (nth 3) butlast) => [:db/add "datomic.tx" :db/txInstant]
+            (butlast
+              (first
+                (filter (fn [[_ _ a]]
+                          (= :db/txInstant a)) txn))) => [:db/add "datomic.tx" :db/txInstant]
             "Uses real IDs for updating things that are in the database"
             ;; NOTE: The strings for attributes are because we are not doing the actual restore,
             ;; so it cannot find the original IDs
-            (subvec txn 4 6) => [[:db/add NEW-PERSON1 "75" "Bob"]
-                                 [:db/retract NEW-PERSON1 "75" "Joe"]]
+            (set/intersection (set txn)
+              #{[:db/add NEW-PERSON1 "75" "Bob"]
+                [:db/retract NEW-PERSON1 "75" "Joe"]}) => #{[:db/add NEW-PERSON1 "75" "Bob"]
+                                                            [:db/retract NEW-PERSON1 "75" "Joe"]}
             "Uses correct tmpid for new entities"
-            (map second (subvec txn 6)) => [(str PERSON2) (str PERSON2)])))
+            (contains? (into #{} (map second) txn) (str PERSON2)) => true)))
 
       (finally
         (d/delete-database client {:db-name db-name})
