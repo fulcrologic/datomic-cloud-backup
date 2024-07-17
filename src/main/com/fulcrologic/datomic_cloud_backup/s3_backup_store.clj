@@ -13,102 +13,132 @@
    in a lot of requests and network overhead.
    "
   (:require
-    [clojure.java.io :as io]
     [clojure.string :as str]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
+    [taoensso.encore :as enc]
     [taoensso.nippy :as nippy]
     [taoensso.timbre :as log])
   (:import
-    (com.amazonaws ClientConfiguration)
-    (com.amazonaws.services.s3 AmazonS3ClientBuilder AmazonS3)
-    (com.amazonaws.services.s3.model ObjectMetadata S3ObjectSummary)
-    (com.amazonaws.services.s3.transfer TransferManager TransferManagerBuilder)
-    (java.io InputStream ByteArrayOutputStream OutputStream ByteArrayInputStream File FileOutputStream BufferedOutputStream)
-    (java.util Date)))
+    (java.io File)
+    (software.amazon.awssdk.auth.credentials DefaultCredentialsProvider)
+    (software.amazon.awssdk.core.sync RequestBody)
+    (software.amazon.awssdk.services.s3 S3Client)
+    (software.amazon.awssdk.services.s3.model GetObjectRequest
+                                              HeadObjectRequest
+                                              ListObjectsV2Request PutObjectRequest NoSuchKeyException PutObjectRequest S3Object)))
 
 (defn aws-credentials? []
-  (let [k (System/getenv "AWS_ACCESS_KEY_ID")]
-    (string? k)))
+  (boolean
+    (enc/catching
+      (let [cp    (DefaultCredentialsProvider/create)
+            creds (.resolveCredentials cp)]
+        (some? creds)))))
 
-(defn- ^AmazonS3 new-s3-client
+(defn new-s3-client
   "Creates an s3 client. S3 clients are cacheable as long as credentials have not changed. The connection itself is created
-  per request. Assumes you have credentials set in your environment according to AWS documentation."
-  ([] (new-s3-client {}))
-  ([{:keys [region]}]
-   (let [client-config (doto (ClientConfiguration.)
-                         ;; the only kind of errors that are retried are those that aws itself responds with as retryable.
-                         ;; This setting is intended to make it so that s3 operations retry until they succeed (as long
-                         ;; as they *can* succeed. See docstring and https://docs.aws.amazon.com/general/latest/gr/api-retries.html
-                         ;; The default is only 3 retries.
-                         (.setMaxErrorRetry 30))
-         builder       (doto (AmazonS3ClientBuilder/standard)
-                         (.setClientConfiguration client-config))]
-     (when region
-       (.setRegion builder region))
-     (.build builder))))
+  per request.
 
-(defn- aws-object-exists? [aws-client bucket nm] (.doesObjectExist aws-client bucket nm))
+  DO NOT USE DIRECTLY. Use large object stores (one per bucket) instead, since they can be configured for easy dev override."
+  ^S3Client []
+  (try
+    (-> (S3Client/builder)
+      (.credentialsProvider (DefaultCredentialsProvider/create))
+      (.build))
+    (catch Exception e
+      (log/error "Cannot create s3 connection" (.getMessage e)))))
 
-(defn- metadata-with [{:keys [disposition content-type content-length]}]
-  (let [object-meta (new ObjectMetadata)]
-    (when disposition (.setContentDisposition object-meta disposition))
-    (when content-type (.setContentType object-meta content-type))
-    (when content-length (.setContentLength object-meta (long content-length)))
-    object-meta))
+(defn get-object
+  "Get an object from s3. Be sure to use this with with-open to ensure the stream is closed when you are done with it.
+
+  ```
+  (with-open [stream (get-object ...)]
+     ...)
+  ```
+
+  Use `get-object-as-string` for a method that can obtain the string content of an object without such cleanup measures.
+  "
+  ^bytes [^S3Client aws-client ^String bucket-name ^String key]
+  (let [^GetObjectRequest req (-> (GetObjectRequest/builder)
+                                (.bucket bucket-name)
+                                (.key key)
+                                (.build))]
+    (.asByteArray (.getObjectAsBytes aws-client req))))
+
+(defn put-object
+  "Put an object with `key` in the given bucket. The string-or-file can be
+   a string or a java.io.File (in the arity-3 version). The arity 4 version requires that the object be some kind
+   of InputStream. Returns a PutObjectResponse or throws an exception."
+  [^S3Client aws-client ^String bucket-name key ^bytes bs]
+  (let [^PutObjectRequest req (-> (PutObjectRequest/builder)
+                                (.bucket bucket-name)
+                                (.key key)
+                                (.build))]
+    (.putObject aws-client req (RequestBody/fromBytes bs))))
+
+(defn object-exists? [^S3Client aws-client ^String bucket ^String nm]
+  (let [^HeadObjectRequest req (-> (HeadObjectRequest/builder)
+                                 (.bucket bucket)
+                                 (.key nm)
+                                 (.build))]
+    (try
+      (.headObject aws-client req)
+      true
+      (catch NoSuchKeyException _ false))))
+
 
 (defn- put-compressed-edn
   "Compress the given EDN and store it as `key` in the given bucket."
-  [^TransferManager transfer ^String bucket-name key EDN]
+  [^S3Client client ^String bucket-name key EDN]
   (when-not bucket-name
     (throw (ex-info "Cannot write file. No bucket name" {})))
-  (let [tempFile (File/createTempFile "txnupload" "nippy")]
-    (try
-      (let [_      (nippy/freeze-to-file tempFile EDN)
-            upload (.upload transfer bucket-name (str key) tempFile)]
-        (.waitForCompletion upload))
-      (catch Throwable t
-        (log/error t "Unable to upload EDN" key))
-      (finally
-        (.delete tempFile)))))
+  (try
+    (let [^bytes data (nippy/freeze EDN)]
+      (put-object client bucket-name key data))
+    (catch Throwable t
+      (log/error t "Unable to upload EDN" key))))
 
 (defn- get-compressed-edn
   "Get a nippy-compressed object from s3 and decompress it back to EDN."
-  [^TransferManager transfer ^String bucket-name ^String resource-name]
-  (let [tempFile (File/createTempFile "txns" "nippy")]
-    (try
-      (let [download (.download transfer bucket-name resource-name tempFile)
-            _        (.waitForCompletion download)
-            edn      (nippy/thaw-from-file tempFile)]
-        edn)
-      (catch Exception e
-        (log/error e "Thaw failed.")
-        nil)
-      (finally
-        (.delete tempFile)))))
+  [^S3Client client ^String bucket-name ^String resource-name]
+  (let [tempFile (File. resource-name)]
+    (let [^bytes data (get-object client bucket-name resource-name)
+          edn         (nippy/thaw data)]
+      edn)))
 
 (defn- list-objects
   "List all of the objects in the given bucket that have the given prefix"
-  [^AmazonS3 aws-client ^String bucket ^String prefix]
-  (loop [object-listing (.listObjects aws-client bucket prefix)
-         results        []]
-    (let [results (into results
-                    (map (fn [^S3ObjectSummary s]
-                           (str/replace-first (.getKey s) prefix "")))
-                    (.getObjectSummaries object-listing))]
-      (if (.isTruncated object-listing)
-        (recur (.listNextBatchOfObjects aws-client object-listing) results)
-        results))))
+  [^S3Client aws-client ^String bucket ^String prefix]
+  (let [^ListObjectsV2Request req (-> (ListObjectsV2Request/builder)
+                                    (.bucket bucket)
+                                    (.prefix prefix)
+                                    (.build))]
+    (loop [lor     (.listObjectsV2 aws-client req)
+           results []]
+      (let [results (into results
+                      (map (fn [^S3Object s]
+                             (str/replace-first (.key s) prefix "")))
+                      (.contents lor))]
+        (if (.isTruncated lor)
+          (let [^ListObjectsV2Request req (-> (ListObjectsV2Request/builder)
+                                            (.bucket bucket)
+                                            (.prefix prefix)
+                                            (.continuationToken (.nextContinuationToken lor))
+                                            (.build))]
+            (recur
+              (.listObjectsV2 aws-client req)
+              results))
+          results)))))
 
 (defn- artifact-basename [dbname start-t] (format "/%s/%d/" (name dbname) start-t))
 (defn- artifact-name [dbname start-t end-t] (format "/%s/%d/%d/transaction-group.nippy" (name dbname) start-t end-t))
 (defn- last-saved-segment-name [dbname] (format "/%s/last-segment.nippy" (name dbname)))
 
-(deftype S3BackupStore [^AmazonS3 aws-client ^TransferManager transfer ^String bucket-name]
+(deftype S3BackupStore [^S3Client aws-client ^String bucket-name]
   dcbp/BackupStore
   (last-segment-info [this dbname]
     (let [object-name (last-saved-segment-name dbname)
-          data        (when (aws-object-exists? aws-client bucket-name object-name)
-                        (get-compressed-edn transfer bucket-name object-name))]
+          data        (when (object-exists? aws-client bucket-name object-name)
+                        (get-compressed-edn aws-client bucket-name object-name))]
       (if data
         data
         (last (dcbp/saved-segment-info this dbname)))))
@@ -124,8 +154,8 @@
   (save-transactions! [_ dbname transaction-group]
     (let [{:keys [start-t end-t]} transaction-group
           nm (artifact-name dbname start-t end-t)]
-      (put-compressed-edn transfer bucket-name nm transaction-group)
-      (put-compressed-edn transfer bucket-name (last-saved-segment-name dbname) {:start-t start-t :end-t end-t})))
+      (put-compressed-edn aws-client bucket-name nm transaction-group)
+      (put-compressed-edn aws-client bucket-name (last-saved-segment-name dbname) {:start-t start-t :end-t end-t})))
   (load-transaction-group
     [this dbname start-t]
     (let [start-t   (if (= 0 start-t)
@@ -133,18 +163,19 @@
                       start-t)
           nm        (first (list-objects aws-client bucket-name (artifact-basename dbname start-t)))
           full-name (str (artifact-basename dbname start-t) nm)]
-      (get-compressed-edn transfer bucket-name full-name)))
+      (get-compressed-edn aws-client bucket-name full-name)))
   (load-transaction-group
     [_ dbname start-t end-t]
     (let [full-name (artifact-name dbname start-t end-t)]
-      (get-compressed-edn transfer bucket-name full-name))))
+      (get-compressed-edn aws-client bucket-name full-name))))
 
 (defn new-s3-store
   ([bucket s3-options]
-   (let [client   (new-s3-client s3-options)
-         transfer (-> (TransferManagerBuilder/standard)
-                    (.withS3Client client)
-                    (.build))]
-     (->S3BackupStore client transfer bucket)))
+   (let [client (new-s3-client)]
+     (->S3BackupStore client bucket)))
   ([bucket]
    (new-s3-store bucket {})))
+
+(comment
+  (System/getenv)
+  (list-objects (new-s3-client) "dataico-staging-backups" "/staging-shard-3/99400"))

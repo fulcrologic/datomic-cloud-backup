@@ -1,13 +1,15 @@
-{:paths     ["src/main"]
- :deps      {org.clojure/clojure        {:mvn/version "1.10.3"}
-             com.fulcrologic/guardrails {:mvn/version "1.1.5"}
-             com.taoensso/nippy         {:mvn/version "3.1.1"}
-             com.taoensso/tufte         {:mvn/version "2.2.0"}
-             com.taoensso/timbre        {:mvn/version "5.0.0"}}
- :mvn/repos {"cognitect-dev-tools" {:url "https://dev-tools.cognitect.com/maven/releases/"}}
- :aliases   {:dev  {:extra-deps {com.datomic/dev-local         {:mvn/version "0.9.235"}
-                                 com.amazonaws/aws-java-sdk-s3 {:mvn/version "1.11.826"}}}
-             :test {:extra-paths ["src/test"]
-                    :main-opts   ["-m" "kaocha.runner"]
-                    :extra-deps  {fulcrologic/fulcro-spec {:mvn/version "3.1.11"}
-                                  lambdaisland/kaocha     {:mvn/version "1.0.732"}}}}}
+{:paths   ["src/main"]
+ :deps    {org.clojure/clojure        {:mvn/version "1.10.3"}
+           com.fulcrologic/guardrails {:mvn/version "1.1.5"}
+           com.taoensso/nippy         {:mvn/version "3.1.1"}
+           com.taoensso/tufte         {:mvn/version "2.2.0"}
+           com.taoensso/timbre        {:mvn/version "5.0.0"}}
+ :aliases {:dev  {:extra-deps {software.amazon.awssdk/s3      {:mvn/version "2.24.5"}
+                               software.amazon.awssdk/sso     {:mvn/version "2.24.5"}
+                               software.amazon.awssdk/ssooidc {:mvn/version "2.24.5"}
+                               com.datomic/client-cloud       {:mvn/version "1.0.125"}
+                               com.datomic/local              {:mvn/version "1.0.277"}}}
+           :test {:extra-paths ["src/test"]
+                  :main-opts   ["-m" "kaocha.runner"]
+                  :extra-deps  {fulcrologic/fulcro-spec {:mvn/version "3.1.11"}
+                                lambdaisland/kaocha     {:mvn/version "1.0.732"}}}}}
