@@ -1,5 +1,5 @@
 (ns com.fulcrologic.datomic-cloud-backup.s3-backup-store
-  "AWS implementation of a BackupStore on S3.
+  "AWS implementation of a TransactionStore on S3.
 
    NOTES:
 
@@ -134,7 +134,7 @@
 (defn- last-saved-segment-name [dbname] (format "/%s/last-segment.nippy" (name dbname)))
 
 (deftype S3BackupStore [^S3Client aws-client ^String bucket-name]
-  dcbp/BackupStore
+  dcbp/TransactionStore
   (last-segment-info [this dbname]
     (let [object-name (last-saved-segment-name dbname)
           data        (when (object-exists? aws-client bucket-name object-name)

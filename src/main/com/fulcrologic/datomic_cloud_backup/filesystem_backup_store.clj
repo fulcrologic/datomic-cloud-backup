@@ -45,7 +45,7 @@
   (re-pattern (str "^\\Q" (name dbname) "\\E\\.(\\d+)-(\\d+)\\..*$")))
 
 (deftype FilesystemBackupStore [^File base-directory]
-  dcbp/BackupStore
+  dcbp/TransactionStore
   (saved-segment-info [_ dbname]
     (let [stored-segments (list-objects base-directory (backup-file-pattern dbname))]
       (vec (sort-by :start-t stored-segments))))

@@ -40,9 +40,9 @@ in the new database so we can remap them in later incremental steps.
 
 The storage for the backups is represented with the protocol:
 
-* `BackupStore` - A place to store the actual transactions
+* `TransactionStore` - A place to store the actual transactions
 
-This library comes with a sample `BackupStore` based on Filesystems and AWS S3.
+This library comes with a sample `TransactionStore` based on Filesystems and AWS S3.
 
 === Extra Dependencies May Be Required
 
@@ -57,7 +57,7 @@ and run (on a periodic basis) an incremental backup.
 
 === Running a Backup
 
-Basically create a `BackupStore` (`db-store` in the example) that your restoration process will be able to see,
+Basically create a `TransactionStore` (`db-store` in the example) that your restoration process will be able to see,
 and then periodically run a function like this:
 
 [source]

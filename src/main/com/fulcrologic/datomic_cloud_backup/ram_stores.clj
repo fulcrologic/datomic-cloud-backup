@@ -3,7 +3,7 @@
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]))
 
 (deftype RAMDBStore [storage]
-  dcbp/BackupStore
+  dcbp/TransactionStore
   (last-segment-info [this dbname]
     (last (dcbp/saved-segment-info this dbname)))
   (saved-segment-info [_ dbname]

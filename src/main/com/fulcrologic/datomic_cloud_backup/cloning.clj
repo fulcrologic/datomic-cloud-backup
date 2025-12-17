@@ -6,6 +6,7 @@
     [clojure.pprint :refer [pprint]]
     [clojure.set :as set]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
+    [com.fulcrologic.datomic-cloud-backup.id-cache :as idc]
     [datomic.client.api :as d]
     [datomic.client.api.protocols :as dp]
     [taoensso.timbre :as log]
@@ -128,7 +129,7 @@
 
   * dbname - What to call this backup in the store. Does not have to match the actual database name on the connection
   * connection - The connection of the database to back up
-  * store - The BackupStore to write to
+  * store - The TransactionStore to write to
   * options:
     * :txns-per-segment - The number of transactions to try to put in each segment of the backup. Defaults to 10,000
     * :starting-segment - The starting segment of the backup (default 0). Use this to continue a previous backup. The starting-segment
@@ -274,24 +275,169 @@
         (d/transact connection {:tx-data txn})))
     true))
 
+(defn avet-lookup
+  "Performs the actual AVET index lookup for an original ID.
+   Returns the new entity ID or nil if not found."
+  [db old-id]
+  (p ::avet-lookup
+    (let [matching-datoms (seq
+                            (d/datoms db {:index      :avet
+                                          :components [::original-id old-id]}))]
+      (when (> (count matching-datoms) 1)
+        (throw (ex-info "ID Resolution failed! Two entities share the same original ID!" {:original-id old-id})))
+      (-> matching-datoms first :e))))
+
+;; =============================================================================
+;; ID Cache and Monotonic Entity Index Tracking
+;; =============================================================================
+;;
+;; Datomic Cloud entity IDs have this structure:
+;;   Bits 62-42: Partition number (14 bits)
+;;   Bits 41-0:  Entity index (42 bits) - GLOBAL MONOTONIC COUNTER
+;;
+;; This allows us to detect NEW entities without any database lookup:
+;; if an entity's index > max-seen-eidx, it MUST be new (never seen before).
+;;
+;; The LRU cache stores old-id -> new-id mappings. The monotonic tracking
+;; (max-seen-eidx) is separate - it tells us when we can skip the cache entirely.
+
+(def ^:const eidx-mask
+  "Mask for extracting the 42-bit entity index from an entity ID."
+  0x3FFFFFFFFFF)
+
+(defn eid->eidx
+  "Extract the 42-bit entity index from a Datomic entity ID."
+  ^long [^long eid]
+  (bit-and eid eidx-mask))
+
+(defonce ^{:doc "Global ID cache state. Maps db-name -> {:cache LRUCache :max-eidx atom}"}
+  global-id-cache
+  (atom {}))
+
+(def ^:dynamic *id-cache-max-size*
+  "Maximum size for ID caches. Default is 1,000,000 entries (~48MB per cache).
+   Can be bound to a different value before calling restore functions."
+  1000000)
+
+(defn get-id-cache
+  "Get or create an ID cache state for the given database name.
+   Returns a map with :cache (the LRU cache) and :max-eidx (atom tracking max entity index).
+   Uses *id-cache-max-size* for the cache size limit."
+  [db-name]
+  (or (get @global-id-cache db-name)
+      (let [state {:cache    (idc/new-lru-cache {:max-size *id-cache-max-size*})
+                   :max-eidx (atom 0)}]
+        (swap! global-id-cache assoc db-name state)
+        state)))
+
+(defn reset-id-cache!
+  "Reset the ID cache for a database. Useful for testing."
+  [db-name]
+  (swap! global-id-cache dissoc db-name))
+
+(defn cache-lookup
+  "Look up old-id in the cache. Uses monotonic detection to skip cache for definitely-new IDs.
+   Returns the new-id if found, nil otherwise."
+  [{:keys [cache max-eidx]} old-id]
+  (let [eidx (eid->eidx old-id)]
+    (if (> eidx @max-eidx)
+      ;; Entity index higher than anything we've seen = definitely new, skip cache
+      nil
+      ;; Might be in cache
+      (idc/lookup cache old-id))))
+
+(defn cache-store!
+  "Store old-id -> new-id mapping and update max-eidx if needed."
+  [{:keys [cache max-eidx]} old-id new-id]
+  (let [eidx (eid->eidx old-id)]
+    (when (> eidx @max-eidx)
+      (reset! max-eidx eidx))
+    (idc/store! cache old-id new-id)))
+
+(defn is-new-id?
+  "Returns true if old-id's entity index is greater than max-seen-eidx,
+   meaning it MUST be a new entity (never been restored before)."
+  [{:keys [max-eidx]} old-id]
+  (> (eid->eidx old-id) @max-eidx))
+
+(defn record-new-ids!
+  "After a successful transaction, record all the new entity ID mappings.
+   The tempids map has string keys (original IDs as strings) and new DB IDs as values."
+  [cache-state tempids]
+  (doseq [[tempid-str new-id] tempids]
+    (when-let [old-id (parse-long tempid-str)]
+      (cache-store! cache-state old-id new-id))))
+
+(defn id-cache-stats
+  "Get stats for an ID cache state, including both cache stats and max-eidx."
+  [{:keys [cache max-eidx]}]
+  (assoc (idc/cache-stats cache)
+    :max-eidx @max-eidx))
+
+;; Verification support - 1% random verification
+(def ^:dynamic *verification-rate* 0.01)
+
+(defn should-verify?
+  "Returns true approximately *verification-rate* of the time."
+  []
+  (< (rand) *verification-rate*))
+
+(defn verify-new-id-assertion!
+  "Verifies that an ID we asserted was NEW actually doesn't exist in the database.
+   Throws an exception if the assertion was wrong (the ID exists when we thought it was new).
+   
+   This is called on ~1% of 'new' IDs to catch any bugs in the monotonic assumption."
+  [db old-id]
+  (let [existing (avet-lookup db old-id)]
+    (when existing
+      (throw (ex-info "CRITICAL: ID cache assertion failed! ID was marked as NEW but exists in database. This indicates a bug in the monotonic entity index assumption."
+               {:old-id         old-id
+                :eidx           (eid->eidx old-id)
+                :existing-db-id existing
+                :action         :restore-aborted})))
+    true))
+
 (>defn resolve-id
   "Finds the new database's :db/id for the given :db/id, or returns a stringified version of the ID for use as a new
-   tempid."
-  [{:keys [db tx-id id->attr]} old-id]
-  [(s/keys :ref-un [::db ::tx-id ::id->attr]) (s/or :id int? :ident keyword?) => ::e]
+   tempid.
+   
+   When a cache-state is provided, uses the cache to avoid AVET lookups:
+   - If entity index > max-seen-eidx, it's definitely NEW (no lookup needed)
+   - Otherwise checks the cache, falling back to AVET lookup on cache miss
+   
+   When verify? is true and we detect a 'new' ID via monotonic check, we verify
+   the assumption ~1% of the time by actually checking the database."
+  [{:keys [db tx-id id->attr cache-state verify?]} old-id]
+  [(s/keys :req-un [::db]
+           :opt-un [::tx-id ::id->attr ::cache-state ::verify?]) 
+   (s/or :id int? :ident keyword?) => ::e]
   (p `resolve-id
     (let [old-id (get id->attr old-id old-id)]
       (cond
         (= tx-id old-id) "datomic.tx"
         (keyword? old-id) old-id
-        :else (or
-                (let [matching-datoms (seq
-                                        (d/datoms db {:index      :avet
-                                                      :components [::original-id old-id]}))]
-                  (when (> (count matching-datoms) 1)
-                    (throw (ex-info "ID Resolution failed! Two entities share the same original ID!" {:original-id old-id})))
-                  (-> matching-datoms first :e))
-                (str old-id))))))
+        :else 
+        (if cache-state
+          ;; Use the optimized cache path
+          (if (is-new-id? cache-state old-id)
+            ;; Entity index > max-seen means definitely NEW
+            (do
+              ;; Verification: ~1% of the time, verify our assumption is correct
+              (when (and verify? (should-verify?))
+                (verify-new-id-assertion! db old-id))
+              (str old-id))
+            ;; Check the cache
+            (if-let [cached-id (cache-lookup cache-state old-id)]
+              cached-id
+              ;; Cache miss - need AVET lookup
+              (if-let [new-id (avet-lookup db old-id)]
+                (do
+                  (cache-store! cache-state old-id new-id)
+                  new-id)
+                ;; Not found in DB either - must be new
+                (str old-id))))
+          ;; No cache - fall back to direct AVET lookup
+          (or (avet-lookup db old-id) (str old-id)))))))
 
 (>defn bookkeeping-txn
   "Generates a transaction that includes a CAS that verifies the current basis t of the database is the intended
@@ -435,6 +581,25 @@
                                data)]
     [(assoc txn :data data-to-keep) (or data-for-next [])]))
 
+(defn- build-cardinality-cache
+  "Build a cache of attribute cardinalities from the database.
+   Returns a map from attribute ident -> :one or :many."
+  [db]
+  (p ::build-cardinality-cache
+    (into {}
+      (d/q '[:find ?ident ?card-ident
+             :where
+             [?a :db/ident ?ident]
+             [?a :db/cardinality ?card]
+             [?card :db/ident ?card-ident]]
+        db))))
+
+(defn- cached-to-one?
+  "Returns a function that checks cardinality using a pre-built cache."
+  [cardinality-cache]
+  (fn [attr]
+    (= :db.cardinality/one (get cardinality-cache attr))))
+
 (>defn restore-segment!
   "Restore the next segment of a backup. Auto-detects (from the target database) where to resume.
 
@@ -454,10 +619,11 @@
   * options - A map of other options
   ** :blacklist - A set of keywords (attributes) to elide from all transactions.
   ** :rewrite - A map from attribute keyword to a `(fn [attr value] new-value)` that can be used to obfuscate the original value to a new one.
+  ** :verify? - Enable 1% verification of new ID assertions (default true). Set to false for maximum speed.
   "
-  [source-database-name target-conn backup-store {:keys [blacklist rewrite]
-                                                  :or   {blacklist #{}}}]
-  [::db-name ::connection ::dcbp/store (s/keys :opt-un [::blacklist ::rewrite]) => #{:restored-segment
+  [source-database-name target-conn backup-store {:keys [blacklist rewrite verify?]
+                                                  :or   {blacklist #{} verify? true}}]
+  [::db-name ::connection ::dcbp/store (s/keys :opt-un [::blacklist ::rewrite ::verify?]) => #{:restored-segment
                                                                                      :nothing-new-available
                                                                                      :transaction-failed!}]
   (let [current-db             (d/db target-conn)
@@ -472,10 +638,16 @@
       (let
         [segment-start-t (if (< desired-start-t 2) desired-start-t (find-segment-start-t backup-store source-database-name desired-start-t))
          {:keys [refs id->attr transactions] :as tgi} (-load-transactions backup-store source-database-name segment-start-t)
-         result          (atom :restored-segment)]
+         result          (atom :restored-segment)
+         cache-state     (get-id-cache source-database-name)
+         ;; Cache these at segment level - they rarely change
+         initial-db      (d/db target-conn)
+         cached-refs     (atom (all-refs initial-db))
+         cached-card     (atom (build-cardinality-cache initial-db))]
         (when (< segment-start-t 2) (ensure-restore-schema! target-conn))
         (log/infof "Restoring %s segment %d starting at %d." source-database-name segment-start-t desired-start-t)
         (log/infof "There are %d transactions in the segment found." (count transactions))
+        (log/debugf "ID cache stats: %s" (id-cache-stats cache-state))
         (if (<= (+ segment-start-t (count transactions)) desired-start-t)
           (do
             (log/error "Transaction group does NOT have the starting point needed!")
@@ -492,12 +664,15 @@
                                                             (map
                                                               (fn [item] (assoc item :tx tx-id)))
                                                             prior-retained)))
-                  target-refs    (all-refs db)
+                  ;; Use cached refs - update if schema is being added
+                  target-refs    @cached-refs
                   resolved-txn   (resolved-txn {:db          db
                                                 :id->attr    id->attr
-                                                :source-refs refs} tx-entry)
+                                                :source-refs refs
+                                                :cache-state cache-state
+                                                :verify?     verify?} tx-entry)
                   pruned-txn     (prune-tempids-as-values target-refs resolved-txn)
-                  final-txn      (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
+                  final-txn      (rewrite-and-filter-txn {:to-one?   (cached-to-one? @cached-card)
                                                           :id->attr  id->attr
                                                           :blacklist blacklist
                                                           :rewrite   rewrite} pruned-txn)]
@@ -505,8 +680,15 @@
                 (when (empty? final-txn)
                   (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
                 (log/debug "Committing transaction" t)
-                (d/transact target-conn {:tx-data final-txn
-                                         :timeout 10000000})
+                (let [{:keys [tempids]} (d/transact target-conn {:tx-data final-txn
+                                                                  :timeout 10000000})]
+                  ;; Record new ID mappings in the cache
+                  (record-new-ids! cache-state tempids)
+                  ;; If schema was added, update caches
+                  (when (some #(= :db.install/attribute (nth % 2 nil)) final-txn)
+                    (let [new-db (d/db target-conn)]
+                      (reset! cached-refs (all-refs new-db))
+                      (reset! cached-card (build-cardinality-cache new-db)))))
                 (log/debug "Finished transaction" t)
                 (reset! result :restored-segment)
                 (catch Throwable e
@@ -516,6 +698,7 @@
                      :message (ex-message e)
                      :data    (ex-data e)
                      :t       t}))))))
+        (log/infof "Segment complete. ID cache stats: %s" (id-cache-stats cache-state))
         @result))))
 
 (defn restore!!
@@ -536,9 +719,10 @@
    * options - A map of other options
    ** :blacklist - A set of keywords (attributes) to elide from all transactions.
    ** :rewrite - A map from attribute keyword to a `(fn [attr value] new-value)` that can be used to obfuscate the original value to a new one.
+   ** :verify? - Enable 1% verification of new ID assertions (default true). Set to false for maximum speed.
    "
-  [source-database-name target-conn backup-store {:keys [blacklist rewrite]
-                                                  :or   {blacklist #{}}}]
+  [source-database-name target-conn backup-store {:keys [blacklist rewrite verify?]
+                                                  :or   {blacklist #{} verify? true}}]
   (let [current-db                 (d/db target-conn)
         last-restored-t            (or
                                      (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
@@ -550,7 +734,11 @@
                                                (> start-t desired-start-t)
                                                (<= start-t desired-start-t end-t)))
                                      all-segment-info)
-        transaction-source-channel (async/chan 10)]
+        transaction-source-channel (async/chan 10)
+        cache-state                (get-id-cache source-database-name)
+        ;; Segment-level caches for refs and cardinality
+        cached-refs                (atom (all-refs current-db))
+        cached-card                (atom (build-cardinality-cache current-db))]
     (try
       (when (< desired-start-t 2) (ensure-restore-schema! target-conn))
       (async/go-loop [segment-info (first segments-remaining)
@@ -586,6 +774,7 @@
             (and tgi (not failed?))
             #_=> (do
                    (log/info "Restoring transactions from" start-t "to" end-t)
+                   (log/debugf "ID cache stats: %s" (id-cache-stats cache-state))
                    (profile {}
                      (doseq [{:keys [t] :as tx-entry} transactions
                              :when (and (> t last-restored-t))]
@@ -599,27 +788,38 @@
                                                                        (map
                                                                          (fn [item] (assoc item :tx tx-id)))
                                                                        prior-retained)))
-                             target-refs    (all-refs db)
+                             ;; Use cached refs
+                             target-refs    @cached-refs
                              resolved-txn   (resolved-txn {:db          db
                                                            :id->attr    id->attr
-                                                           :source-refs refs} tx-entry)
+                                                           :source-refs refs
+                                                           :cache-state cache-state
+                                                           :verify?     verify?} tx-entry)
                              pruned-txn     (prune-tempids-as-values target-refs resolved-txn)
-                             final-txn      (rewrite-and-filter-txn {:to-one?   (partial to-one? (d/db target-conn))
+                             final-txn      (rewrite-and-filter-txn {:to-one?   (cached-to-one? @cached-card)
                                                                      :id->attr  id->attr
                                                                      :blacklist blacklist
                                                                      :rewrite   rewrite} pruned-txn)]
                          (try
                            (when (empty? final-txn)
                              (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
-                           (p ::run-transaction
-                             (d/transact target-conn {:tx-data final-txn
-                                                      :timeout 10000000}))
+                           (let [{:keys [tempids]} (p ::run-transaction
+                                                     (d/transact target-conn {:tx-data final-txn
+                                                                              :timeout 10000000}))]
+                             ;; Record new ID mappings in the cache
+                             (record-new-ids! cache-state tempids)
+                             ;; If schema was added, update caches
+                             (when (some #(= :db.install/attribute (nth % 2 nil)) final-txn)
+                               (let [new-db (d/db target-conn)]
+                                 (reset! cached-refs (all-refs new-db))
+                                 (reset! cached-card (build-cardinality-cache new-db)))))
                            (catch Throwable e
                              (log/error e "Restore transaction failed!"
                                {:db      source-database-name
                                 :message (ex-message e)
                                 :data    (ex-data e)
                                 :t       t}))))))
+                   (log/infof "Segment complete. ID cache stats: %s" (id-cache-stats cache-state))
                    (recur (inc end-t)))
             :else {:result (str "No more segments to restore. Was looking for the next start: " expected-start-t)})))
       (finally

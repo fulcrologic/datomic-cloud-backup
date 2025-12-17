@@ -1,2 +1,2 @@
 test:
-	clojure -M:test:dev --fail-fast --watch --no-capture-output
+	clojure -M:test:clj-tests --fail-fast --watch --no-capture-output

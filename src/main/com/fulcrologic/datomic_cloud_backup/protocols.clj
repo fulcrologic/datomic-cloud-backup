@@ -1,7 +1,7 @@
 (ns com.fulcrologic.datomic-cloud-backup.protocols
   (:require [clojure.spec.alpha :as s]))
 
-(defprotocol BackupStore
+(defprotocol TransactionStore
   (last-segment-info [this dbname] "Returns `{:start-t a :end-t b}` for the last segment that has been stored. MAY
    return nil indicating that no segments have been backed up, but should NEVER return nil if there are valid
    segments. This is an optimization that prevents you from having to read all of the segment info to figure it out, but it could
@@ -32,4 +32,4 @@
       `(inc end-t)` of the prior one. Transaction groups can vary in size, so do not assume you can guess this value.
       See `last-segment-info` for an optimal way to know what the last segment is, and `save-segment-info` to get a list of them all."))
 
-(s/def ::store #(satisfies? BackupStore %))
+(s/def ::store #(satisfies? TransactionStore %))

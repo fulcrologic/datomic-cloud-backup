@@ -27,6 +27,8 @@
       (recur (cloning/backup-next-segment! dbname source-connection target-store 2)))))
 
 (defn restore! [dbname target-conn db-store]
+  ;; Reset the ID cache for this database before restoring
+  (cloning/reset-id-cache! dbname)
   (while (= :restored-segment (cloning/restore-segment! dbname target-conn db-store {}))))
 
 (defn clean-filesystem! [^File tmpdir]
@@ -184,6 +186,91 @@
       (cloning/resolve-id {:db (d/db conn)} 100) => PERSON2
       "Throws an exception if the original ID isn't unique"
       (cloning/resolve-id {:db (d/db conn)} 101) =throws=> #"Two entities share the same original ID")))
+
+(specification "Resolving IDs with cache state"
+  (let [db-name    (keyword (gensym "db"))
+        _          (d/create-database client {:db-name db-name})
+        conn       (d/connect client {:db-name db-name})
+        person-id  (UUID/randomUUID)
+        person2-id (UUID/randomUUID)
+        _          (cloning/ensure-restore-schema! conn)
+        tx!        (fn [c tx] (as-> (d/transact c {:tx-data tx}) $
+                                (assoc {}
+                                  :data (:tx-data $)
+                                  :tempids (:tempids $)
+                                  :t (dec (:t (d/db c))))))
+        _          (tx! conn sample-schema)
+        {{:strs [PERSON1 PERSON2]} :tempids} (tx! conn [{:db/id                "PERSON1"
+                                                         ::cloning/original-id 99
+                                                         :person/id            person-id
+                                                         :person/name          "Joe"}
+                                                        {:db/id                "PERSON2"
+                                                         ::cloning/original-id 100
+                                                         :person/id            person2-id
+                                                         :person/name          "Sam"}])]
+    
+    ;; Reset the cache to test fresh behavior
+    (cloning/reset-id-cache! db-name)
+    (let [cache-state (cloning/get-id-cache db-name)]
+      (component "With an empty cache (max-eidx = 0)"
+        (assertions
+          "IDs with eidx > 0 are detected as new (since max-eidx starts at 0)"
+          (cloning/is-new-id? cache-state 99) => true
+          
+          "resolve-id returns tempid string for IDs detected as new"
+          (cloning/resolve-id {:db (d/db conn) :cache-state cache-state} 99) => "99"))
+      
+      ;; Simulate having already restored entity 99 -> PERSON1
+      (cloning/cache-store! cache-state 99 PERSON1)
+      
+      (component "After recording ID 99"
+        (assertions
+          "lookup returns the mapped ID"
+          (cloning/cache-lookup cache-state 99) => PERSON1
+          
+          "max-eidx is now 99"
+          @(:max-eidx cache-state) => 99
+          
+          "ID 100 is still new (eidx > 99)"
+          (cloning/is-new-id? cache-state 100) => true
+          
+          "ID 50 is NOT new (eidx <= 99)"
+          (cloning/is-new-id? cache-state 50) => false
+          
+          "resolve-id uses cache for known IDs"
+          (cloning/resolve-id {:db (d/db conn) :cache-state cache-state} 99) => PERSON1
+          
+          "resolve-id returns tempid string for definitely new IDs"
+          (cloning/resolve-id {:db (d/db conn) :cache-state cache-state} 200) => "200")))
+    
+    (d/delete-database client {:db-name db-name})))
+
+(specification "Verification of new ID assertion"
+  (let [db-name    (keyword (gensym "db"))
+        _          (d/create-database client {:db-name db-name})
+        conn       (d/connect client {:db-name db-name})
+        person-id  (UUID/randomUUID)
+        _          (cloning/ensure-restore-schema! conn)
+        tx!        (fn [c tx] (as-> (d/transact c {:tx-data tx}) $
+                                (assoc {}
+                                  :data (:tx-data $)
+                                  :tempids (:tempids $)
+                                  :t (dec (:t (d/db c))))))
+        _          (tx! conn sample-schema)
+        {{:strs [PERSON1]} :tempids} (tx! conn [{:db/id                "PERSON1"
+                                                 ::cloning/original-id 99
+                                                 :person/id            person-id
+                                                 :person/name          "Joe"}])]
+    (try
+      (component "verify-new-id-assertion!"
+        (assertions
+          "Returns true when ID truly doesn't exist"
+          (cloning/verify-new-id-assertion! (d/db conn) 9999) => true
+          
+          "Throws when ID exists but was thought to be new"
+          (cloning/verify-new-id-assertion! (d/db conn) 99) =throws=> #"ID cache assertion failed"))
+      (finally
+        (d/delete-database client {:db-name db-name})))))
 
 (specification "Bookkeeping transaction"
   (let [db-name        (keyword (gensym "db"))
