@@ -1,20 +1,16 @@
 (ns com.fulcrologic.datomic-cloud-backup.cloning
   "Copy a database with history via transaction logs. Based on code from Cognitect."
   (:require
-    [com.fulcrologic.guardrails.core :refer [>defn => ?]]
     [clojure.core.async :as async]
-    [clojure.pprint :refer [pprint]]
-    [clojure.set :as set]
-    [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
+    [clojure.spec.alpha :as s]
     [com.fulcrologic.datomic-cloud-backup.id-cache :as idc]
+    [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
+    [com.fulcrologic.guardrails.core :refer [=> >defn ?]]
     [datomic.client.api :as d]
     [datomic.client.api.protocols :as dp]
     [taoensso.timbre :as log]
-    [taoensso.truss :refer [have]]
-    [taoensso.tufte :as tufte :refer [profile p]]
-    [clojure.spec.alpha :as s])
-  (:import (clojure.lang ExceptionInfo)
-           (java.util Date)))
+    [taoensso.tufte :as tufte :refer [p profile]])
+  (:import (java.util Date)))
 
 (s/def ::db #(satisfies? dp/Db %))
 (s/def ::datom #(int? (:e %)))
@@ -325,10 +321,10 @@
    Uses *id-cache-max-size* for the cache size limit."
   [db-name]
   (or (get @global-id-cache db-name)
-      (let [state {:cache    (idc/new-lru-cache {:max-size *id-cache-max-size*})
-                   :max-eidx (atom 0)}]
-        (swap! global-id-cache assoc db-name state)
-        state)))
+    (let [state {:cache    (idc/new-lru-cache {:max-size *id-cache-max-size*})
+                 :max-eidx (atom 0)}]
+      (swap! global-id-cache assoc db-name state)
+      state)))
 
 (defn reset-id-cache!
   "Reset the ID cache for a database. Useful for testing."
@@ -385,7 +381,7 @@
 (defn verify-new-id-assertion!
   "Verifies that an ID we asserted was NEW actually doesn't exist in the database.
    Throws an exception if the assertion was wrong (the ID exists when we thought it was new).
-   
+
    This is called on ~1% of 'new' IDs to catch any bugs in the monotonic assumption."
   [db old-id]
   (let [existing (avet-lookup db old-id)]
@@ -400,23 +396,23 @@
 (>defn resolve-id
   "Finds the new database's :db/id for the given :db/id, or returns a stringified version of the ID for use as a new
    tempid.
-   
+
    When a cache-state is provided, uses the cache to avoid AVET lookups:
    - If entity index > max-seen-eidx, it's definitely NEW (no lookup needed)
    - Otherwise checks the cache, falling back to AVET lookup on cache miss
-   
+
    When verify? is true and we detect a 'new' ID via monotonic check, we verify
    the assumption ~1% of the time by actually checking the database."
   [{:keys [db tx-id id->attr cache-state verify?]} old-id]
   [(s/keys :req-un [::db]
-           :opt-un [::tx-id ::id->attr ::cache-state ::verify?]) 
+     :opt-un [::tx-id ::id->attr ::cache-state ::verify?])
    (s/or :id int? :ident keyword?) => ::e]
   (p `resolve-id
     (let [old-id (get id->attr old-id old-id)]
       (cond
         (= tx-id old-id) "datomic.tx"
         (keyword? old-id) old-id
-        :else 
+        :else
         (if cache-state
           ;; Use the optimized cache path
           (if (is-new-id? cache-state old-id)
@@ -624,8 +620,8 @@
   [source-database-name target-conn backup-store {:keys [blacklist rewrite verify?]
                                                   :or   {blacklist #{} verify? true}}]
   [::db-name ::connection ::dcbp/store (s/keys :opt-un [::blacklist ::rewrite ::verify?]) => #{:restored-segment
-                                                                                     :nothing-new-available
-                                                                                     :transaction-failed!}]
+                                                                                               :nothing-new-available
+                                                                                               :transaction-failed!}]
   (let [current-db             (d/db target-conn)
         last-restored-t        (or
                                  (::last-source-transaction (d/pull current-db [::last-source-transaction] ::last-source-transaction))
@@ -681,7 +677,7 @@
                   (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
                 (log/debug "Committing transaction" t)
                 (let [{:keys [tempids]} (d/transact target-conn {:tx-data final-txn
-                                                                  :timeout 10000000})]
+                                                                 :timeout 10000000})]
                   ;; Record new ID mappings in the cache
                   (record-new-ids! cache-state tempids)
                   ;; If schema was added, update caches

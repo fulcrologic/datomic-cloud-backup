@@ -2,22 +2,22 @@
   (:require
     [clojure.data.json :as json]
     [com.fulcrologic.datomic-cloud-backup.logging :as logging]
-    [fulcro-spec.core :refer [specification behavior component assertions =>]]))
+    [fulcro-spec.core :refer [=> assertions component specification]]))
 
 (specification "make-json-output-fn"
   (let [output-fn (logging/make-json-output-fn {:service-name "test-service"})]
 
     (component "with map log entry containing :msg"
-      (let [log-data   {:level      :info
-                        :?ns-str    "test.ns"
-                        :?line      42
-                        :?err       nil
-                        :vargs      [{:msg       "Test message"
-                                      :extra-key "extra-value"
-                                      :count     5}]
-                        :timestamp_ (delay "2024-01-01T00:00:00Z")}
-            output     (output-fn log-data)
-            parsed     (json/read-str output :key-fn keyword)]
+      (let [log-data {:level      :info
+                      :?ns-str    "test.ns"
+                      :?line      42
+                      :?err       nil
+                      :vargs      [{:msg       "Test message"
+                                    :extra-key "extra-value"
+                                    :count     5}]
+                      :timestamp_ (delay "2024-01-01T00:00:00Z")}
+            output   (output-fn log-data)
+            parsed   (json/read-str output :key-fn keyword)]
         (assertions
           "Produces valid JSON"
           (string? output) => true

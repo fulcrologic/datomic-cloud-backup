@@ -2,7 +2,7 @@
   (:require
     [com.fulcrologic.datomic-cloud-backup.filesystem-backup-store :as fs]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
-    [fulcro-spec.core :refer [specification behavior component assertions =>]]
+    [fulcro-spec.core :refer [=> assertions specification]]
     [taoensso.timbre :as log]))
 
 (specification "Filesystem Store"
@@ -28,11 +28,11 @@
       saved? => true
       "Can return the sorted list of available segments that can be restored"
       (dcbp/saved-segment-info store :db)
-      => [{:start-t 1
-           :end-t   2
+      => [{:start-t  1
+           :end-t    2
            :filename "db.1-2.nippy"}
-          {:start-t 3
-           :end-t   6
+          {:start-t  3
+           :end-t    6
            :filename "db.3-6.nippy"}]
       "Can find the last saved segment"
       (dcbp/last-segment-info store :db) => {:start-t 3 :end-t 6}

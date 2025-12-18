@@ -1,8 +1,8 @@
 (ns com.fulcrologic.datomic-cloud-backup.s3-backup-store-test
   (:require
-    [com.fulcrologic.datomic-cloud-backup.s3-backup-store :as bs]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
-    [fulcro-spec.core :refer [specification behavior component assertions =>]]
+    [com.fulcrologic.datomic-cloud-backup.s3-backup-store :as bs]
+    [fulcro-spec.core :refer [=> assertions specification]]
     [taoensso.timbre :as log]))
 
 (specification "S3 Store"

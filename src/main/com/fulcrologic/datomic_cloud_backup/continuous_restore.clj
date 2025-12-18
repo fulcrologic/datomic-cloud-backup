@@ -1,17 +1,17 @@
 (ns com.fulcrologic.datomic-cloud-backup.continuous-restore
   "Continuous restore functionality that polls a TransactionStore and applies
    new segments to a target database as they become available.
-   
+
    This namespace provides background restore that:
    - Pre-fetches segments ahead of the consumer using core.async
    - Uses exponential backoff on errors
    - Supports graceful shutdown via a running? flag
    - Logs structured maps for CloudWatch integration"
   (:require
-    [clojure.core.async :as async :refer [go go-loop >! <! <!! chan close!]]
+    [clojure.core.async :as async :refer [<! >! chan close! go-loop]]
     [com.fulcrologic.datomic-cloud-backup.cloning :as cloning]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
-    [com.fulcrologic.guardrails.core :refer [>defn =>]]
+    [com.fulcrologic.guardrails.core :refer [=> >defn]]
     [datomic.client.api :as d]
     [taoensso.timbre :as log]))
 
@@ -57,21 +57,21 @@
 
 (defn- start-prefetch-producer!
   "Starts a producer that pre-fetches transaction segments into a buffered channel.
-   
+
    Returns a map with:
    - :channel - The channel to read segments from
    - :stop! - Function to stop the producer
-   
+
    The producer fetches segments ahead of where restore currently is, providing
    them via the channel. It uses backpressure naturally - blocks when buffer is full.
-   
+
    Each item on the channel is either:
    - A segment map from load-transaction-group (with :start-t, :end-t, :transactions, etc.)
    - A map with :caught-up? true when there's nothing new to fetch
    - A map with :error and the exception when fetching fails"
   [transaction-store dbname next-start-t-atom running? {:keys [buffer-size]
                                                         :or   {buffer-size 5}}]
-  (let [segment-chan (chan buffer-size)
+  (let [segment-chan      (chan buffer-size)
         producer-running? (volatile! true)]
     ;; Start the producer go-loop
     (go-loop []
@@ -89,21 +89,21 @@
               ;; Put segment on channel (blocks if buffer full)
               (>! segment-chan segment)
               (recur))
-            
+
             ;; Caught up - signal and wait briefly
             (:caught-up? result)
             (do
               (>! segment-chan result)
               (<! (async/timeout 100))
               (recur))
-            
+
             ;; Error - signal and wait longer
             (:error result)
             (do
               (>! segment-chan result)
               (<! (async/timeout 1000))
               (recur))
-            
+
             ;; Unexpected - just continue
             :else
             (do
@@ -122,45 +122,45 @@
   "Get the last source transaction that was restored to the target database."
   [target-conn]
   (let [db (d/db target-conn)]
-    (or (::cloning/last-source-transaction 
+    (or (::cloning/last-source-transaction
           (d/pull db [::cloning/last-source-transaction] ::cloning/last-source-transaction))
-        0)))
+      0)))
 
 (defn- process-segment!
   "Process a single segment, restoring it to the target database.
-   
+
    Returns:
    - {:success true :end-t n} on success
    - {:success false :error e} on failure"
   [source-database-name target-conn transaction-store segment options]
   (let [start-time (System/currentTimeMillis)
         {:keys [start-t end-t]} segment
-        result (try
-                 (let [restore-result (cloning/restore-segment! 
-                                        source-database-name 
-                                        target-conn 
-                                        ;; Create a minimal store that just returns this segment
-                                        ;; This is a bit of a hack but avoids duplicating restore logic
-                                        (reify dcbp/TransactionStore
-                                          (last-segment-info [_ _] {:start-t start-t :end-t end-t})
-                                          (saved-segment-info [_ _] [{:start-t start-t :end-t end-t}])
-                                          (load-transaction-group [_ _ _] segment)
-                                          (load-transaction-group [_ _ _ _] segment)
-                                          (save-transactions! [_ _ _] nil))
-                                        options)]
-                   (case restore-result
-                     :restored-segment {:success true :end-t end-t}
-                     :nothing-new-available {:success true :end-t end-t :nothing-new? true}
-                     :transaction-failed! {:success false :error (ex-info "Transaction failed" {:result restore-result})}
-                     :partial-segment {:success false :error (ex-info "Partial segment" {:result restore-result})}
-                     {:success false :error (ex-info "Unknown result" {:result restore-result})}))
-                 (catch Throwable e
-                   {:success false :error e}))
-        elapsed (- (System/currentTimeMillis) start-time)]
+        result     (try
+                     (let [restore-result (cloning/restore-segment!
+                                            source-database-name
+                                            target-conn
+                                            ;; Create a minimal store that just returns this segment
+                                            ;; This is a bit of a hack but avoids duplicating restore logic
+                                            (reify dcbp/TransactionStore
+                                              (last-segment-info [_ _] {:start-t start-t :end-t end-t})
+                                              (saved-segment-info [_ _] [{:start-t start-t :end-t end-t}])
+                                              (load-transaction-group [_ _ _] segment)
+                                              (load-transaction-group [_ _ _ _] segment)
+                                              (save-transactions! [_ _ _] nil))
+                                            options)]
+                       (case restore-result
+                         :restored-segment {:success true :end-t end-t}
+                         :nothing-new-available {:success true :end-t end-t :nothing-new? true}
+                         :transaction-failed! {:success false :error (ex-info "Transaction failed" {:result restore-result})}
+                         :partial-segment {:success false :error (ex-info "Partial segment" {:result restore-result})}
+                         {:success false :error (ex-info "Unknown result" {:result restore-result})}))
+                     (catch Throwable e
+                       {:success false :error e}))
+        elapsed    (- (System/currentTimeMillis) start-time)]
     (if (:success result)
       (let [current-t (get-last-restored-t target-conn)
             {:keys [end-t] :as source-last} (dcbp/last-segment-info transaction-store source-database-name)
-            lag (when end-t (- end-t current-t))]
+            lag       (when end-t (- end-t current-t))]
         (when-not (:nothing-new? result)
           (log/info {:msg           "Segment restored"
                      :db            source-database-name
@@ -172,12 +172,12 @@
       result)))
 
 ;; =============================================================================
-;; Main Continuous Restore Function  
+;; Main Continuous Restore Function
 ;; =============================================================================
 
 (>defn continuous-restore!
   "Continuously restore from a TransactionStore with polling.
-   
+
    Arguments:
    - source-database-name: Name used for this backup/restore
    - target-conn: Connection to target database
@@ -190,9 +190,9 @@
      - :blacklist - Set of attributes to exclude from restore
      - :rewrite - Map of attribute -> rewrite fn
      - :verify? - Enable ID verification (default true)
-   
+
    Returns: A channel that receives the final result when stopped
-   
+
    The restore runs in background threads. It:
    1. Starts a prefetch producer to load segments ahead
    2. Consumes segments and restores them
@@ -211,29 +211,29 @@
                          :rewrite   rewrite
                          :verify?   verify?}
         result-chan     (chan 1)
-        
+
         ;; Determine where to start based on target database state
         last-restored-t (get-last-restored-t target-conn)
         desired-start-t (if (pos? last-restored-t) (inc last-restored-t) 1)
         next-start-t    (atom desired-start-t)
-        
+
         ;; Start the prefetch producer
-        {:keys [channel stop!]} (start-prefetch-producer! 
-                                  transaction-store 
-                                  source-database-name 
-                                  next-start-t 
+        {:keys [channel stop!]} (start-prefetch-producer!
+                                  transaction-store
+                                  source-database-name
+                                  next-start-t
                                   running?
                                   {:buffer-size prefetch-buffer})]
-    
+
     ;; Ensure restore schema exists
     (when (< desired-start-t 2)
       (cloning/ensure-restore-schema! target-conn))
-    
-    (log/info {:msg       "Starting continuous restore"
-               :db        source-database-name
-               :start-t   desired-start-t
-               :options   (select-keys options [:poll-interval-ms :prefetch-buffer :max-retry-delay-ms])})
-    
+
+    (log/info {:msg     "Starting continuous restore"
+               :db      source-database-name
+               :start-t desired-start-t
+               :options (select-keys options [:poll-interval-ms :prefetch-buffer :max-retry-delay-ms])})
+
     ;; Start the consumer go-loop
     (go-loop [retry-delay initial-retry-delay-ms
               segments-restored 0]
@@ -259,7 +259,7 @@
               (>! result-chan {:status            :channel-closed
                                :segments-restored segments-restored})
               (close! result-chan))
-            
+
             ;; Caught up - poll after delay
             (:caught-up? item)
             (do
@@ -269,7 +269,7 @@
                          :poll-interval-ms poll-interval-ms})
               (<! (async/timeout poll-interval-ms))
               (recur initial-retry-delay-ms segments-restored))
-            
+
             ;; Error from producer
             (:error item)
             (let [e (:error item)]
@@ -279,7 +279,7 @@
                           :retry-delay-ms retry-delay})
               (<! (async/timeout retry-delay))
               (recur (calculate-backoff retry-delay max-retry-delay-ms) segments-restored))
-            
+
             ;; Normal segment - process it
             :else
             (let [result (process-segment! source-database-name target-conn transaction-store item restore-options)]
@@ -297,14 +297,14 @@
                               :retry-delay-ms retry-delay})
                   (<! (async/timeout retry-delay))
                   (recur (calculate-backoff retry-delay max-retry-delay-ms) segments-restored))))))))
-    
+
     result-chan))
 
 (comment
   ;; Example usage:
-  ;; 
+  ;;
   ;; (def running? (volatile! true))
-  ;; 
+  ;;
   ;; (def result-chan
   ;;   (continuous-restore!
   ;;     "my-database"
@@ -314,10 +314,10 @@
   ;;     {:poll-interval-ms 5000
   ;;      :prefetch-buffer 5
   ;;      :max-retry-delay-ms 300000}))
-  ;; 
+  ;;
   ;; ;; To stop:
   ;; (vreset! running? false)
-  ;; 
+  ;;
   ;; ;; Wait for final result:
   ;; (async/<!! result-chan)
   )

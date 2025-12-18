@@ -1,13 +1,13 @@
 (ns com.fulcrologic.datomic-cloud-backup.live-transaction-store
   "A TransactionStore implementation that reads directly from a live Datomic database connection.
-   
+
    This store provides read-only access to transaction history from a source database,
    presenting it through the same TransactionStore interface used by backup stores.
    Useful for direct database-to-database cloning without intermediate storage."
   (:require
     [com.fulcrologic.datomic-cloud-backup.cloning :as cloning]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
-    [com.fulcrologic.guardrails.core :refer [>defn =>]]
+    [com.fulcrologic.guardrails.core :refer [=> >defn]]
     [datomic.client.api :as d]
     [datomic.client.api.protocols :as dp]
     [taoensso.timbre :as log]))
@@ -27,37 +27,37 @@
 
 (deftype LiveTransactionStore [source-conn segment-size id->attr-cache]
   dcbp/TransactionStore
-  
+
   (last-segment-info [_ _dbname]
     (let [db        (d/db source-conn)
           current-t (:t db)]
       (log/debug "last-segment-info: current db t =" current-t)
       {:start-t 1
        :end-t   current-t}))
-  
+
   (saved-segment-info [_ _dbname]
     (let [db        (d/db source-conn)
           current-t (:t db)
-          segments  (loop [start   1
-                           result  []]
+          segments  (loop [start  1
+                           result []]
                       (if (> start current-t)
                         result
                         (let [end (min (+ start (dec segment-size)) current-t)]
                           (recur (inc end)
-                                 (conj result {:start-t start :end-t end})))))]
+                            (conj result {:start-t start :end-t end})))))]
       (log/debug "saved-segment-info: generated" (count segments) "virtual segments up to t =" current-t)
       segments))
-  
+
   (save-transactions! [_ _dbname _transaction-group]
     ;; No-op for live store - we read directly from the source
     (log/debug "save-transactions! called on LiveTransactionStore (no-op)")
     nil)
-  
+
   (load-transaction-group [this dbname start-t]
     (let [end-t (+ start-t (dec segment-size))]
       (log/debug "load-transaction-group (2-arity): start-t =" start-t "computed end-t =" end-t)
       (dcbp/load-transaction-group this dbname start-t end-t)))
-  
+
   (load-transaction-group [_ _dbname start-t end-t]
     (let [db           (d/db source-conn)
           current-t    (:t db)
@@ -68,11 +68,11 @@
         (do
           (log/warn "Requested start-t" start-t "is beyond current db t" current-t)
           nil)
-        (let [_        (log/info "Loading transactions from source: start-t =" start-t 
-                                 "end-t =" end-t "capped-end-t =" capped-end-t)
+        (let [_        (log/info "Loading transactions from source: start-t =" start-t
+                         "end-t =" end-t "capped-end-t =" capped-end-t)
               ;; tx-range end is exclusive, so we use (inc capped-end-t)
-              tx-range (d/tx-range source-conn {:start start-t 
-                                                :end   (inc capped-end-t) 
+              tx-range (d/tx-range source-conn {:start start-t
+                                                :end   (inc capped-end-t)
                                                 :limit -1})
               tx-vec   (vec tx-range)]
           (if (empty? tx-vec)
@@ -84,8 +84,8 @@
                   refs         (cloning/all-refs db)
                   id->attr     (ensure-id->attr-cache! source-conn id->attr-cache)
                   transactions (mapv #(update % :data cloning/mapify-datoms) tx-vec)]
-              (log/info "Loaded" (count transactions) "transactions, actual range:" 
-                        actual-start "to" actual-end)
+              (log/info "Loaded" (count transactions) "transactions, actual range:"
+                actual-start "to" actual-end)
               {:refs         refs
                :id->attr     id->attr
                :transactions transactions
@@ -94,13 +94,13 @@
 
 (>defn new-live-store
   "Create a LiveTransactionStore that reads directly from a source Datomic connection.
-   
+
    This store presents the transaction log of a live database through the TransactionStore
    protocol, enabling direct database-to-database cloning without intermediate storage.
-   
+
    Arguments:
    - source-conn: A Datomic connection to read transactions from
-   
+
    Options:
    - :segment-size - Number of transactions per virtual segment (default 1000)"
   [source-conn {:keys [segment-size] :or {segment-size 1000}}]

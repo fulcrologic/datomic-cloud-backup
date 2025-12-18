@@ -1,9 +1,9 @@
 (ns com.fulcrologic.datomic-cloud-backup.live-transaction-store-test
   (:require
-    [datomic.client.api :as d]
     [com.fulcrologic.datomic-cloud-backup.live-transaction-store :as lts]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
-    [fulcro-spec.core :refer [specification behavior component assertions =>]]))
+    [datomic.client.api :as d]
+    [fulcro-spec.core :refer [=> assertions component specification]]))
 
 (defonce client (d/client {:server-type :dev-local
                            :storage-dir :mem

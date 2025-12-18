@@ -2,10 +2,9 @@
   (:require
     [clojure.java.io :as io]
     [com.fulcrologic.datomic-cloud-backup.protocols :as dcbp]
-    [taoensso.nippy :as nippy]
-    [taoensso.timbre :as log])
+    [taoensso.nippy :as nippy])
   (:import
-    (java.io File ByteArrayOutputStream)
+    (java.io ByteArrayOutputStream File)
     (java.util.regex Pattern)))
 
 (defn- put-compressed-edn

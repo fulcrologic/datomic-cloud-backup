@@ -1,9 +1,9 @@
 (ns com.fulcrologic.datomic-cloud-backup.logging
   "JSON logging support for CloudWatch integration.
-   
+
    Log messages should be maps with a :msg key for the human-readable message.
    Additional keys become structured data that CloudWatch Logs Insights can query.
-   
+
    Example:
    ```
    (log/info {:msg \"Segment restored\"
@@ -27,10 +27,10 @@
 
 (defn make-json-output-fn
   "Creates a Timbre output-fn that prints JSON to stdout for CloudWatch ingestion.
-   
+
    Options:
    - :service-name - Name to include in log entries (default \"datomic-replication\")
-   
+
    Log entries can be maps with a :msg key. Additional keys become structured fields.
    If the log message is not a map, it becomes the :msg field."
   [{:keys [service-name]
@@ -59,7 +59,7 @@
 
 (defn configure-json-logging!
   "Configure Timbre for JSON output to stdout.
-   
+
    Options:
    - :min-level - Minimum log level (default :info)
    - :service-name - Service name in log entries (default \"datomic-replication\")"
@@ -68,6 +68,6 @@
            service-name "datomic-replication"}}]
   (log/set-config!
     (-> log/default-config
-        (assoc :output-fn (make-json-output-fn {:service-name service-name}))
-        (assoc :min-level min-level)
-        (assoc :appenders {:println (appenders/println-appender {:stream :auto})}))))
+      (assoc :output-fn (make-json-output-fn {:service-name service-name}))
+      (assoc :min-level min-level)
+      (assoc :appenders {:println (appenders/println-appender {:stream :auto})}))))

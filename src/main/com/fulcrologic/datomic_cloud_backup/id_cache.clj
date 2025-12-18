@@ -1,10 +1,8 @@
 (ns com.fulcrologic.datomic-cloud-backup.id-cache
   "LRU cache for long->long mappings with bounded size.
-  
+
   This is a simple LRU cache - it doesn't know anything about Datomic IDs
   or entity indices. That logic belongs in the restore code that uses this cache."
-  (:require
-    [com.fulcrologic.guardrails.core :refer [>defn =>]])
   (:import
     (java.util LinkedHashMap)))
 
@@ -54,26 +52,26 @@
       (.put lru-map (Long/valueOf (long k)) (Long/valueOf (long v)))
       ;; Track evictions: if size didn't grow and we're at capacity, something was evicted
       (when (and (= size-before max-size)
-                 (= (.size lru-map) max-size))
+              (= (.size lru-map) max-size))
         (set! evictions (inc evictions)))))
 
   (cache-size [_] (.size lru-map))
-  
+
   (max-cache-size [_] max-size)
 
   (cache-stats [_]
-    {:hits           hits
-     :misses         misses
-     :evictions      evictions
-     :size           (.size lru-map)
-     :max-size       max-size}))
+    {:hits      hits
+     :misses    misses
+     :evictions evictions
+     :size      (.size lru-map)
+     :max-size  max-size}))
 
 (defn new-lru-cache
   "Create a new LRU cache for long->long mappings.
-   
+
    Options:
    - :max-size - Maximum number of entries before LRU eviction (default 1,000,000)
-   
+
    Memory usage is approximately 48 bytes per entry."
   ([] (new-lru-cache {}))
   ([{:keys [max-size] :or {max-size default-max-cache-size}}]
