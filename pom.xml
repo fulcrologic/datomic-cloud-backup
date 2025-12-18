@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <packaging>jar</packaging>
     <groupId>com.fulcrologic</groupId>
     <artifactId>datomic-cloud-backup</artifactId>
-    <version>0.0.21-SNAPSHOT</version>
+    <version>1.0.0-SNAPSHOT</version>
     <name>datomic-cloud-backup</name>
     <description>A library for cloning Datomic Cloud databases.</description>
     <url>https://github.com/fulcrologic/datomic-cloud-backup</url>
@@ -23,8 +24,8 @@
         <url>https://github.com/fulcrologic/datomic-cloud-backup</url>
         <connection>scm:git:git://github.com/fulcrologic/datomic-cloud-backup.git</connection>
         <developerConnection>scm:git:ssh://git@github.com/fulcrologic/datomic-cloud-backup.git</developerConnection>
-      <tag>HEAD</tag>
-  </scm>
+        <tag>HEAD</tag>
+    </scm>
     <distributionManagement>
         <repository>
             <id>clojars</id>
@@ -35,13 +36,63 @@
     <dependencies>
         <dependency>
             <groupId>org.clojure</groupId>
+            <artifactId>data.json</artifactId>
+            <version>2.5.1</version>
+        </dependency>
+        <dependency>
+            <groupId>org.clojure</groupId>
             <artifactId>clojure</artifactId>
-            <version>1.10.3</version>
+            <version>1.12.3</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fulcrologic</groupId>
+            <artifactId>guardrails</artifactId>
+            <version>1.2.12</version>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.collections</groupId>
+            <artifactId>eclipse-collections</artifactId>
+            <version>13.0.0</version>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <version>2.38.2</version>
+        </dependency>
+        <dependency>
+            <groupId>com.taoensso</groupId>
+            <artifactId>tufte</artifactId>
+            <version>3.0.0</version>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sso</artifactId>
+            <version>2.38.2</version>
         </dependency>
         <dependency>
             <groupId>com.taoensso</groupId>
             <artifactId>timbre</artifactId>
-            <version>5.0.0</version>
+            <version>6.8.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.taoensso</groupId>
+            <artifactId>nippy</artifactId>
+            <version>3.6.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.datomic</groupId>
+            <artifactId>client-cloud</artifactId>
+            <version>1.0.131</version>
+        </dependency>
+        <dependency>
+            <groupId>org.clojure</groupId>
+            <artifactId>core.async</artifactId>
+            <version>1.8.741</version>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>ssooidc</artifactId>
+            <version>2.38.2</version>
         </dependency>
     </dependencies>
     <build>
@@ -72,10 +123,6 @@
         <repository>
             <id>clojars</id>
             <url>https://repo.clojars.org/</url>
-        </repository>
-        <repository>
-            <id>cognitect-dev-tools</id>
-            <url>https://dev-tools.cognitect.com/maven/releases/</url>
         </repository>
     </repositories>
 </project>
