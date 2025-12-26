@@ -190,6 +190,7 @@
      - :blacklist - Set of attributes to exclude from restore
      - :rewrite - Map of attribute -> rewrite fn
      - :verify? - Enable ID verification (default true)
+     - :stats-interval-segments - Log cache stats every N segments (default 10, 0 to disable)
 
    Returns: A channel that receives the final result when stopped
 
@@ -201,16 +202,19 @@
    5. Stops when @running? is false"
   [source-database-name target-conn transaction-store running? options]
   [string? any? ::dcbp/store any? map? => any?]
-  (let [{:keys [poll-interval-ms prefetch-buffer max-retry-delay-ms blacklist rewrite verify?]
-         :or   {poll-interval-ms   5000
-                prefetch-buffer    5
-                max-retry-delay-ms 300000
-                blacklist          #{}
-                verify?            true}} options
+  (let [{:keys [poll-interval-ms prefetch-buffer max-retry-delay-ms blacklist rewrite verify?
+                stats-interval-segments]
+         :or   {poll-interval-ms        5000
+                prefetch-buffer         5
+                max-retry-delay-ms      300000
+                blacklist               #{}
+                verify?                 true
+                stats-interval-segments 10}} options
         restore-options {:blacklist blacklist
                          :rewrite   rewrite
                          :verify?   verify?}
         result-chan     (chan 1)
+        cache-state     (cloning/get-id-cache source-database-name)
 
         ;; Determine where to start based on target database state
         last-restored-t (get-last-restored-t target-conn)
@@ -232,7 +236,8 @@
     (log/info {:msg     "Starting continuous restore"
                :db      source-database-name
                :start-t desired-start-t
-               :options (select-keys options [:poll-interval-ms :prefetch-buffer :max-retry-delay-ms])})
+               :options (select-keys options [:poll-interval-ms :prefetch-buffer :max-retry-delay-ms
+                                              :stats-interval-segments])})
 
     ;; Start the consumer go-loop
     (go-loop [retry-delay initial-retry-delay-ms
@@ -285,10 +290,34 @@
             (let [result (process-segment! source-database-name target-conn transaction-store item restore-options)]
               (if (:success result)
                 ;; Success - reset backoff and continue
-                (do
+                (let [new-count (inc segments-restored)]
                   ;; Update start-t atom to sync with actual progress
                   (reset! next-start-t (inc (get-last-restored-t target-conn)))
-                  (recur initial-retry-delay-ms (inc segments-restored)))
+                  ;; Log cache stats periodically
+                  (when (and (pos? stats-interval-segments)
+                          (zero? (mod new-count stats-interval-segments)))
+                    (let [{:keys [hits misses monotonic-new avet-hit avet-miss-new]} (cloning/id-cache-stats cache-state)
+                          ;; IDs where we checked (eidx <= max-eidx): cache hits + cache misses
+                          ;; Cache misses = avet-hit + avet-miss-new
+                          checked-ids    (+ hits avet-hit avet-miss-new)
+                          cache-hit-pct  (when (pos? checked-ids)
+                                           (* 100.0 (/ hits checked-ids)))
+                          ;; Total new IDs = monotonic-new + avet-miss-new
+                          total-new      (+ monotonic-new avet-miss-new)
+                          ;; Of new IDs, how many required a lookup?
+                          new-lookup-pct (when (pos? total-new)
+                                           (* 100.0 (/ avet-miss-new total-new)))]
+                      (log/info {:msg            "ID cache stats"
+                                 :db             source-database-name
+                                 :segments       new-count
+                                 :monotonic-new  monotonic-new
+                                 :cache-hits     hits
+                                 :cache-misses   misses
+                                 :avet-hit       avet-hit
+                                 :avet-miss-new  avet-miss-new
+                                 :cache-hit-pct  (some-> cache-hit-pct double Math/round)
+                                 :new-lookup-pct (some-> new-lookup-pct double Math/round)})))
+                  (recur initial-retry-delay-ms new-count))
                 ;; Failure - backoff and retry
                 (let [e (:error result)]
                   (log/error {:msg            "Restore error, retrying"

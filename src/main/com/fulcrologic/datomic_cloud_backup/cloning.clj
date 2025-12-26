@@ -275,7 +275,7 @@
   "Performs the actual AVET index lookup for an original ID.
    Returns the new entity ID or nil if not found."
   [db old-id]
-  (p ::avet-lookup
+  (p `avet-lookup
     (let [matching-datoms (seq
                             (d/datoms db {:index      :avet
                                           :components [::original-id old-id]}))]
@@ -317,12 +317,18 @@
 
 (defn get-id-cache
   "Get or create an ID cache state for the given database name.
-   Returns a map with :cache (the LRU cache) and :max-eidx (atom tracking max entity index).
+   Returns a map with :cache (the LRU cache), :max-eidx (atom tracking max entity index),
+   and additional stat counters.
    Uses *id-cache-max-size* for the cache size limit."
   [db-name]
   (or (get @global-id-cache db-name)
-    (let [state {:cache    (idc/new-lru-cache {:max-size *id-cache-max-size*})
-                 :max-eidx (atom 0)}]
+    (let [state {:cache            (idc/new-lru-cache {:max-size *id-cache-max-size*})
+                 :max-eidx         (atom 0)
+                 ;; Stats for understanding cache effectiveness
+                 :monotonic-new    (atom 0)  ; IDs skipped via monotonic detection (eidx > max-eidx)
+                 :avet-hit         (atom 0)  ; Cache miss but found in AVET
+                 :avet-miss-new    (atom 0)} ; Cache miss, not in AVET, so actually new
+          ]
       (swap! global-id-cache assoc db-name state)
       state)))
 
@@ -335,12 +341,13 @@
   "Look up old-id in the cache. Uses monotonic detection to skip cache for definitely-new IDs.
    Returns the new-id if found, nil otherwise."
   [{:keys [cache max-eidx]} old-id]
-  (let [eidx (eid->eidx old-id)]
-    (if (> eidx @max-eidx)
-      ;; Entity index higher than anything we've seen = definitely new, skip cache
-      nil
-      ;; Might be in cache
-      (idc/lookup cache old-id))))
+  (p `cache-lookup
+    (let [eidx (eid->eidx old-id)]
+      (if (> eidx @max-eidx)
+        ;; Entity index higher than anything we've seen = definitely new, skip cache
+        nil
+        ;; Might be in cache
+        (idc/lookup cache old-id)))))
 
 (defn cache-store!
   "Store old-id -> new-id mapping and update max-eidx if needed."
@@ -365,10 +372,19 @@
       (cache-store! cache-state old-id new-id))))
 
 (defn id-cache-stats
-  "Get stats for an ID cache state, including both cache stats and max-eidx."
-  [{:keys [cache max-eidx]}]
+  "Get stats for an ID cache state, including both cache stats and max-eidx.
+   Returns a map with:
+   - :hits/:misses - LRU cache hit/miss counts
+   - :monotonic-new - IDs detected as new via eidx > max-eidx (no lookup needed)
+   - :avet-hit - Cache miss but found in AVET
+   - :avet-miss-new - Cache miss, not in AVET, so actually new (lookup wasted)
+   - :max-eidx - Current maximum entity index seen"
+  [{:keys [cache max-eidx monotonic-new avet-hit avet-miss-new]}]
   (assoc (idc/cache-stats cache)
-    :max-eidx @max-eidx))
+    :max-eidx      @max-eidx
+    :monotonic-new @monotonic-new
+    :avet-hit      @avet-hit
+    :avet-miss-new @avet-miss-new))
 
 ;; Verification support - 1% random verification
 (def ^:dynamic *verification-rate* 0.01)
@@ -402,7 +418,12 @@
    - Otherwise checks the cache, falling back to AVET lookup on cache miss
 
    When verify? is true and we detect a 'new' ID via monotonic check, we verify
-   the assumption ~1% of the time by actually checking the database."
+   the assumption ~1% of the time by actually checking the database.
+
+   Tracks stats in cache-state:
+   - :monotonic-new - IDs detected as new via eidx > max-eidx (no lookup needed)
+   - :avet-hit - Cache miss but found in AVET
+   - :avet-miss-new - Cache miss, not in AVET, so actually new (lookup wasted)"
   [{:keys [db tx-id id->attr cache-state verify?]} old-id]
   [(s/keys :req-un [::db]
      :opt-un [::tx-id ::id->attr ::cache-state ::verify?])
@@ -418,6 +439,7 @@
           (if (is-new-id? cache-state old-id)
             ;; Entity index > max-seen means definitely NEW
             (do
+              (swap! (:monotonic-new cache-state) inc)
               ;; Verification: ~1% of the time, verify our assumption is correct
               (when (and verify? (should-verify?))
                 (verify-new-id-assertion! db old-id))
@@ -428,10 +450,13 @@
               ;; Cache miss - need AVET lookup
               (if-let [new-id (avet-lookup db old-id)]
                 (do
+                  (swap! (:avet-hit cache-state) inc)
                   (cache-store! cache-state old-id new-id)
                   new-id)
                 ;; Not found in DB either - must be new
-                (str old-id))))
+                (do
+                  (swap! (:avet-miss-new cache-state) inc)
+                  (str old-id)))))
           ;; No cache - fall back to direct AVET lookup
           (or (avet-lookup db old-id) (str old-id)))))))
 
