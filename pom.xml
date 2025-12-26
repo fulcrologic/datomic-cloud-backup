@@ -4,7 +4,7 @@
     <packaging>jar</packaging>
     <groupId>com.fulcrologic</groupId>
     <artifactId>datomic-cloud-backup</artifactId>
-    <version>1.0.1</version>
+    <version>1.0.2-SNAPSHOT</version>
     <name>datomic-cloud-backup</name>
     <description>A library for cloning Datomic Cloud databases.</description>
     <url>https://github.com/fulcrologic/datomic-cloud-backup</url>
@@ -23,7 +23,7 @@
         <url>https://github.com/fulcrologic/datomic-cloud-backup</url>
         <connection>scm:git:git://github.com/fulcrologic/datomic-cloud-backup.git</connection>
         <developerConnection>scm:git:ssh://git@github.com/fulcrologic/datomic-cloud-backup.git</developerConnection>
-        <tag>datomic-cloud-backup-1.0.1</tag>
+        <tag>HEAD</tag>
     </scm>
     <distributionManagement>
         <repository>
