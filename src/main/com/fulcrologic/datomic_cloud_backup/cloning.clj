@@ -471,6 +471,10 @@
    This function requires the current target db (for resolving original IDs), `id->attr` for finding the mappings from
    the base datomic schema in the old database to the new one, and a set of attribute db ids (in the source db)
    that represent ref attributes in the source database (`source-refs`).
+
+   NOTE: If the source database was itself created via a restore operation, it may contain
+   ::original-id datoms. These are filtered out since we generate our own ::original-id
+   bookkeeping for the new target database.
    "
   [{:keys [db id->attr source-refs] :as env} {:keys [t data] :as tx-entry}]
   [(s/keys :req-un [::db ::id->attr ::source-refs]) ::txn => (s/coll-of ::txn-op :kind vector?)]
@@ -478,6 +482,17 @@
     (let [tx-id (-> data first :tx)
           tm    (tx-time tx-entry)
           env   (assoc env :tx-id tx-id)
+          ;; Filter out ::original-id and ::last-source-transaction datoms from source
+          ;; These are internal bookkeeping from a previous restore and should not be copied
+          original-id-attr-id (some (fn [[k v]] (when (= v ::original-id) k)) id->attr)
+          last-src-txn-attr-id (some (fn [[k v]] (when (= v ::last-source-transaction) k)) id->attr)
+          filtered-data (cond->> data
+                          original-id-attr-id (remove #(= (:a %) original-id-attr-id))
+                          last-src-txn-attr-id (remove #(= (:a %) last-src-txn-attr-id)))
+          _ (when (and original-id-attr-id (some #(= (:a %) original-id-attr-id) data))
+              (log/info {:msg "Filtered out ::original-id datoms from source transaction"
+                         :t t
+                         :reason "Source DB was itself restored from another database"}))
           k->id (into {}
                   (keep
                     (fn [{:keys [e a v added]}]
@@ -485,14 +500,14 @@
                               (= (id->attr a) :db/ident)
                               (keyword? v))
                         [v e])))
-                  data)
+                  filtered-data)
           data  (mapv
                   (fn [m]
                     (update m :v (fn [v]
                                    (if (vector? v)
                                      (mapv (fn [k] (get k->id k k)) v)
                                      v))))
-                  (mapify-datoms data))]
+                  (mapify-datoms filtered-data))]
       (log/info "In-transaction schema map:" k->id)
       (if (< (compare tm #inst "2000-01-01") 0)
         ;; Record that we has an empty transaction. The timestamp here is a bit of a pain, since I'm just
@@ -650,32 +665,50 @@
             :partial-segment)
           (doseq [{:keys [t] :as tx-entry} transactions
                   :when (and (> t last-restored-t) (= @result :restored-segment))]
-            (let [db             (d/db target-conn)
-                  prior-retained (get @previous-transaction-carryover source-database-name)
-                  [tx-entry datoms-for-next] (extract-conflicting-tuple-creation id->attr tx-entry)
-                  _              (swap! previous-transaction-carryover assoc source-database-name datoms-for-next)
-                  tx-id          (first (keep :tx (:data tx-entry)))
-                  tx-entry       (update tx-entry :data (fn [data]
-                                                          (into data
-                                                            (map
-                                                              (fn [item] (assoc item :tx tx-id)))
-                                                            prior-retained)))
-                  ;; Use cached refs - update if schema is being added
-                  target-refs    @cached-refs
-                  resolved-txn   (resolved-txn {:db          db
-                                                :id->attr    id->attr
-                                                :source-refs refs
-                                                :cache-state cache-state
-                                                :verify?     verify?} tx-entry)
-                  pruned-txn     (prune-tempids-as-values target-refs resolved-txn)
-                  final-txn      (rewrite-and-filter-txn {:to-one?   (cached-to-one? @cached-card)
-                                                          :id->attr  id->attr
-                                                          :blacklist blacklist
-                                                          :rewrite   rewrite} pruned-txn)]
-              (try
+            (try
+              (let [db             (d/db target-conn)
+                    prior-retained (get @previous-transaction-carryover source-database-name)
+                    [tx-entry datoms-for-next] (extract-conflicting-tuple-creation id->attr tx-entry)
+                    _              (swap! previous-transaction-carryover assoc source-database-name datoms-for-next)
+                    tx-id          (first (keep :tx (:data tx-entry)))
+                    tx-entry       (update tx-entry :data (fn [data]
+                                                            (into data
+                                                              (map
+                                                                (fn [item] (assoc item :tx tx-id)))
+                                                              prior-retained)))
+                    ;; Use cached refs - update if schema is being added
+                    target-refs    @cached-refs
+                    ;; Wrap each step with logging to identify where NPE occurs
+                    _              (log/debug {:msg "Starting resolved-txn" :t t})
+                    resolved-txn   (resolved-txn {:db          db
+                                                  :id->attr    id->attr
+                                                  :source-refs refs
+                                                  :cache-state cache-state
+                                                  :verify?     verify?} tx-entry)
+                    _              (log/debug {:msg "Starting prune-tempids-as-values" :t t})
+                    pruned-txn     (prune-tempids-as-values target-refs resolved-txn)
+                    _              (log/debug {:msg "Starting rewrite-and-filter-txn" :t t})
+                    final-txn      (rewrite-and-filter-txn {:to-one?   (cached-to-one? @cached-card)
+                                                            :id->attr  id->attr
+                                                            :blacklist blacklist
+                                                            :rewrite   rewrite} pruned-txn)]
                 (when (empty? final-txn)
                   (throw (ex-info "Incorrect transaction didn't record restore (empty!)" {})))
-                (log/debug "Committing transaction" t)
+                ;; Debug logging: check for nil values that could cause NPE
+                (let [nil-datoms (filter (fn [[op e a v :as datom]]
+                                           (or (nil? op) (nil? e) (nil? a)
+                                               ;; v can be nil for retractions, but check for other issues
+                                               (and (= op :db/add) (nil? v))))
+                                         final-txn)]
+                  (when (seq nil-datoms)
+                    (log/warn {:msg        "Transaction contains nil values!"
+                               :t          t
+                               :nil-datoms (take 5 nil-datoms)
+                               :nil-count  (count nil-datoms)})))
+                (log/debug {:msg          "Committing transaction"
+                            :t            t
+                            :datom-count  (count final-txn)
+                            :sample-datoms (take 3 final-txn)})
                 (let [{:keys [tempids]} (d/transact target-conn {:tx-data final-txn
                                                                  :timeout 10000000})]
                   ;; Record new ID mappings in the cache
@@ -686,14 +719,18 @@
                       (reset! cached-refs (all-refs new-db))
                       (reset! cached-card (build-cardinality-cache new-db)))))
                 (log/debug "Finished transaction" t)
-                (reset! result :restored-segment)
-                (catch Throwable e
-                  (reset! result :transaction-failed!)
-                  (log/error e "Restore transaction failed!"
-                    {:db      source-database-name
-                     :message (ex-message e)
-                     :data    (ex-data e)
-                     :t       t}))))))
+                (reset! result :restored-segment))
+              (catch Throwable e
+                (reset! result :transaction-failed!)
+                (log/error {:msg          "Restore transaction failed!"
+                            :db           source-database-name
+                            :error        (ex-message e)
+                            :error-data   (ex-data e)
+                            :t            t
+                            :tx-entry-t   (:t tx-entry)
+                            :tx-data-count (count (:data tx-entry))
+                            :tx-data-sample (take 5 (:data tx-entry))
+                            :stack-trace  (take 15 (mapv str (.getStackTrace e)))})))))
         (log/infof "Segment complete. ID cache stats: %s" (id-cache-stats cache-state))
         @result))))
 

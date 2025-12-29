@@ -656,3 +656,66 @@
       (finally
         (d/delete-database client {:db-name target-db-name})
         (d/delete-database client {:db-name db-name})))))
+
+(specification "Filters ::original-id datoms from source DB that was itself a restore target"
+  ;; This test reproduces the production bug where stagingStorage was itself created via restore
+  ;; and contains ::original-id datoms in its transaction log. When we try to restore from
+  ;; stagingStorage to a new target, those ::original-id datoms would cause conflicts because:
+  ;; 1. The source has [entity-X ::original-id old-value]
+  ;; 2. bookkeeping-txn tries to add [entity-X ::original-id entity-X-source-id]
+  ;; 3. Both resolve to the same target entity -> conflict (cardinality-one)
+  ;;
+  ;; Fix: resolved-txn now filters out ::original-id and ::last-source-transaction datoms
+  (let [target-db-name (keyword (gensym "target-db"))
+        dbname         "test-filter-original-id"
+        _              (d/create-database client {:db-name target-db-name})
+        target-conn    (d/connect client {:db-name target-db-name})
+        ;; Simulated source entity IDs
+        source-entity-1 74766790688843
+        source-tx-id    13194139533333
+        ;; Create a fake segment where the source DB has ::original-id datoms
+        ;; (because it was itself restored from another database)
+        fake-segment    {:refs         #{73}  ;; 73 is ::original-id which is a ref-like long
+                         :id->attr     {10 :db/ident
+                                        40 :db/valueType
+                                        41 :db/cardinality
+                                        50 :db/txInstant
+                                        ;; These are the restore bookkeeping attributes from the SOURCE db
+                                        73 :com.fulcrologic.datomic-cloud-backup.cloning/original-id
+                                        74 :com.fulcrologic.datomic-cloud-backup.cloning/last-source-transaction}
+                         :start-t      13
+                         :end-t        13
+                         :transactions [{:t    13
+                                         :data [;; Transaction timestamp
+                                                {:e source-tx-id :a 50 :v #inst "2024-01-01" :tx source-tx-id :added true}
+                                                ;; This is the problematic datom - source entity has ::original-id
+                                                ;; because source DB was itself a restore target
+                                                {:e source-entity-1 :a 73 :v 101155069755470 :tx source-tx-id :added true}
+                                                ;; Normal data - entity with a :db/ident
+                                                {:e source-entity-1 :a 10 :v :tax/sordicom-minoristas :tx source-tx-id :added true}]}]}
+        fake-store      (reify dcbp/TransactionStore
+                          (last-segment-info [_ _] {:start-t 13 :end-t 13})
+                          (saved-segment-info [_ _] [{:start-t 13 :end-t 13}])
+                          (load-transaction-group [_ _ _] fake-segment)
+                          (load-transaction-group [_ _ _ _] fake-segment)
+                          (save-transactions! [_ _ _] nil))]
+    (try
+      (cloning/reset-id-cache! dbname)
+
+      (let [result (cloning/restore-segment! dbname target-conn fake-store {})]
+        (assertions
+          "Should successfully restore by filtering out source's ::original-id datoms"
+          result => :restored-segment)
+
+        ;; Verify the entity was created with OUR ::original-id (not the source's)
+        (let [db (d/db target-conn)
+              restored-entities (d/q '[:find ?e ?orig-id
+                                       :where [?e :com.fulcrologic.datomic-cloud-backup.cloning/original-id ?orig-id]]
+                                     db)]
+          (assertions
+            "The restored entity should have ::original-id pointing to the SOURCE entity ID, not the old backup's ID"
+            ;; We should have an ::original-id = source-entity-1, NOT 101155069755470
+            (some #(= source-entity-1 (second %)) restored-entities) => true)))
+
+      (finally
+        (d/delete-database client {:db-name target-db-name})))))
