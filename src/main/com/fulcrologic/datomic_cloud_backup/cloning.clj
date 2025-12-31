@@ -36,6 +36,11 @@
 (s/def ::rewrite (? (s/map-of keyword? fn?)))
 (s/def ::blacklist (? (s/every keyword? :kind set?)))
 
+(def internal-attributes
+  "Attributes that are used internally for restore bookkeeping.
+   These should be filtered from SOURCE data but NOT from the bookkeeping we generate."
+  #{::original-id ::last-source-transaction})
+
 (>defn all-refs
   "Return a set of all :db.type/ref entity IDs from the provided DB"
   [db]
@@ -180,38 +185,42 @@
      :opt-un [::rewrite ::blacklist])
    (s/coll-of ::txn-op :kind vector?) => (s/coll-of ::txn-op :kind vector?)]
   (p `rewrite-and-filter-txn
-    (->> transaction
-      (sort-by #(not= :db/add (first %)))
-      (reduce
-        (fn [{:keys [adds] :as acc} [op e a v :as original]]
-          (let [added    (= :db/add op)
-                v        (if-let [rewrite (and added (get rewrite a))]
-                           (rewrite a v)
-                           v)
-                retract? (= :db/retract op)
-                noop?    (and retract? (contains? adds a) to-one? (to-one? a))]
-            ;; This is necessary because rewrite can cause the add/retract to match, which will cause
-            ;; a datom conflict.
-            (cond
-              noop? acc
-              added (-> acc
-                      (update :adds conj a)
-                      (update :result conj [op e a v]))
-              retract? (update acc :result conj [op e a v])
-              :else (update acc :result conj original))))
-        {:adds #{} :result []})
-      :result
-      (remove #(contains? blacklist (nth % 2)))
-      vec)))
+    (let [sorted (sort-by #(not= :db/add (first %)) transaction)]
+      (persistent!
+        (:result
+          (reduce
+            (fn [{:keys [adds] :as acc} [op e a v :as original]]
+              ;; Filter blacklisted attributes first (single pass optimization)
+              (if (contains? blacklist a)
+                acc
+                (let [added    (= :db/add op)
+                      v        (if-let [rewrite-fn (and added (get rewrite a))]
+                                 (rewrite-fn a v)
+                                 v)
+                      retract? (= :db/retract op)
+                      noop?    (and retract? (contains? adds a) to-one? (to-one? a))]
+                  ;; This is necessary because rewrite can cause the add/retract to match, which will cause
+                  ;; a datom conflict.
+                  (cond
+                    noop? acc
+                    added (-> acc
+                            (update :adds conj a)
+                            (update :result conj! [op e a v]))
+                    retract? (update acc :result conj! [op e a v])
+                    :else (update acc :result conj! original)))))
+            {:adds #{} :result (transient [])}
+            sorted))))))
 
 (>defn tx-time
   "Returns the transaction time of an entry from a tx-entry."
   [{:keys [data]}]
   [::txn => inst?]
   (let [tx-id (:tx (first data))
-        tm    (:v (first (filter #(and
-                                    (= tx-id (:e %))
-                                    (inst? (:v %))) data)))]
+        ;; Use some instead of filter+first - stops at first match
+        tm    (some #(let [v (:v %)]
+                       (when (and (= tx-id (:e %)) (inst? v))
+                         v))
+                data)]
     (or tm #inst "1970-01-01")))
 
 (defn -load-transactions
@@ -322,12 +331,12 @@
    Uses *id-cache-max-size* for the cache size limit."
   [db-name]
   (or (get @global-id-cache db-name)
-    (let [state {:cache            (idc/new-lru-cache {:max-size *id-cache-max-size*})
-                 :max-eidx         (atom 0)
+    (let [state {:cache         (idc/new-lru-cache {:max-size *id-cache-max-size*})
+                 :max-eidx      (atom 0)
                  ;; Stats for understanding cache effectiveness
-                 :monotonic-new    (atom 0)  ; IDs skipped via monotonic detection (eidx > max-eidx)
-                 :avet-hit         (atom 0)  ; Cache miss but found in AVET
-                 :avet-miss-new    (atom 0)} ; Cache miss, not in AVET, so actually new
+                 :monotonic-new (atom 0)                    ; IDs skipped via monotonic detection (eidx > max-eidx)
+                 :avet-hit      (atom 0)                    ; Cache miss but found in AVET
+                 :avet-miss-new (atom 0)}                   ; Cache miss, not in AVET, so actually new
           ]
       (swap! global-id-cache assoc db-name state)
       state)))
@@ -381,9 +390,9 @@
    - :max-eidx - Current maximum entity index seen"
   [{:keys [cache max-eidx monotonic-new avet-hit avet-miss-new]}]
   (assoc (idc/cache-stats cache)
-    :max-eidx      @max-eidx
+    :max-eidx @max-eidx
     :monotonic-new @monotonic-new
-    :avet-hit      @avet-hit
+    :avet-hit @avet-hit
     :avet-miss-new @avet-miss-new))
 
 ;; Verification support - 1% random verification
@@ -497,9 +506,11 @@
    the base datomic schema in the old database to the new one, and a set of attribute db ids (in the source db)
    that represent ref attributes in the source database (`source-refs`).
 
-   NOTE: If the source database was itself created via a restore operation, it may contain
-   ::original-id datoms. These are filtered out since we generate our own ::original-id
-   bookkeeping for the new target database.
+   NOTE: Two types of source datoms are filtered:
+   1. Composite tuple attribute values - Datomic auto-generates these from component attributes
+   2. Internal restore bookkeeping attributes (::original-id, ::last-source-transaction) - these are
+      filtered from SOURCE data if the source DB was itself a restore target. We generate our own
+      bookkeeping for the new target.
    "
   [{:keys [db id->attr source-refs] :as env} {:keys [t data] :as tx-entry}]
   [(s/keys :req-un [::db ::id->attr ::source-refs]) ::txn => (s/coll-of ::txn-op :kind vector?)]
@@ -507,32 +518,55 @@
     (let [tx-id (-> data first :tx)
           tm    (tx-time tx-entry)
           env   (assoc env :tx-id tx-id)
-          ;; Filter out ::original-id and ::last-source-transaction datoms from source
-          ;; These are internal bookkeeping from a previous restore and should not be copied
-          original-id-attr-id (some (fn [[k v]] (when (= v ::original-id) k)) id->attr)
-          last-src-txn-attr-id (some (fn [[k v]] (when (= v ::last-source-transaction) k)) id->attr)
-          filtered-data (cond->> data
-                          original-id-attr-id (remove #(= (:a %) original-id-attr-id))
-                          last-src-txn-attr-id (remove #(= (:a %) last-src-txn-attr-id)))
-          _ (when (and original-id-attr-id (some #(= (:a %) original-id-attr-id) data))
-              (log/info {:msg "Filtered out ::original-id datoms from source transaction"
-                         :t t
-                         :reason "Source DB was itself restored from another database"}))
-          k->id (into {}
-                  (keep
-                    (fn [{:keys [e a v added]}]
-                      (when (and added
-                              (= (id->attr a) :db/ident)
-                              (keyword? v))
-                        [v e])))
-                  filtered-data)
-          data  (mapv
-                  (fn [m]
-                    (update m :v (fn [v]
-                                   (if (vector? v)
-                                     (mapv (fn [k] (get k->id k k)) v)
-                                     v))))
-                  (mapify-datoms filtered-data))]
+          ;; OPTIMIZATION: Single pass over id->attr to find both:
+          ;; - composite-tuple-attr-ids (attrs with :db/tupleAttrs)
+          ;; - internal-attr-ids (::original-id, ::last-source-transaction)
+          {:keys [composite-tuple-attr-ids internal-attr-ids]}
+          (reduce-kv
+            (fn [acc attr-id attr-ident]
+              (cond-> acc
+                (= attr-ident :db/tupleAttrs)
+                (update :composite-tuple-attr-ids conj attr-id)
+
+                (contains? internal-attributes attr-ident)
+                (update :internal-attr-ids conj attr-id)))
+            {:composite-tuple-attr-ids #{}
+             :internal-attr-ids        #{}}
+            id->attr)
+          ;; OPTIMIZATION: Single pass over data to:
+          ;; 1. Find composite-tuple-eids
+          ;; 2. Build k->id map for :db/ident datoms
+          ;; 3. Filter and mapify datoms in one go
+          {:keys [composite-tuple-eids k->id]}
+          (reduce
+            (fn [acc {:keys [e a v added] :as datom}]
+              (cond-> acc
+                ;; Track entities that have :db/tupleAttrs (these are composite tuple attrs)
+                (contains? composite-tuple-attr-ids a)
+                (update :composite-tuple-eids conj e)
+
+                ;; Build k->id for :db/ident datoms
+                (and added (= (id->attr a) :db/ident) (keyword? v))
+                (assoc-in [:k->id v] e)))
+            {:composite-tuple-eids #{}
+             :k->id                {}}
+            data)
+          ;; Now filter and transform data in a single pass
+          processed-data (into []
+                           (keep
+                             (fn [{:keys [e a v tx added] :as datom}]
+                               ;; Filter out composite tuple values and internal attrs
+                               (when-not (or (contains? composite-tuple-eids a)
+                                           (contains? internal-attr-ids a))
+                                 ;; Transform v if it's a vector (tuple value needing k->id lookup)
+                                 {:e     e
+                                  :a     a
+                                  :v     (if (vector? v)
+                                           (mapv (fn [k] (get k->id k k)) v)
+                                           v)
+                                  :tx    tx
+                                  :added added})))
+                           data)]
       (log/info "In-transaction schema map:" k->id)
       (if (< (compare tm #inst "2000-01-01") 0)
         ;; Record that we has an empty transaction. The timestamp here is a bit of a pain, since I'm just
@@ -556,7 +590,7 @@
                          (contains? source-refs original-a) (resolve-id env v)
                          :else v)]
                 [op e a v])))
-          data)))))
+          processed-data)))))
 
 (defn find-segment-start-t
   "When resuming a backup the last t in the database won't likely be on a segment boundary. This scans the real segments
@@ -722,17 +756,17 @@
                 ;; Debug logging: check for nil values that could cause NPE
                 (let [nil-datoms (filter (fn [[op e a v :as datom]]
                                            (or (nil? op) (nil? e) (nil? a)
-                                               ;; v can be nil for retractions, but check for other issues
-                                               (and (= op :db/add) (nil? v))))
-                                         final-txn)]
+                                             ;; v can be nil for retractions, but check for other issues
+                                             (and (= op :db/add) (nil? v))))
+                                   final-txn)]
                   (when (seq nil-datoms)
                     (log/warn {:msg        "Transaction contains nil values!"
                                :t          t
                                :nil-datoms (take 5 nil-datoms)
                                :nil-count  (count nil-datoms)})))
-                (log/debug {:msg          "Committing transaction"
-                            :t            t
-                            :datom-count  (count final-txn)
+                (log/debug {:msg           "Committing transaction"
+                            :t             t
+                            :datom-count   (count final-txn)
                             :sample-datoms (take 3 final-txn)})
                 (let [{:keys [tempids]} (d/transact target-conn {:tx-data final-txn
                                                                  :timeout 10000000})]
@@ -747,15 +781,15 @@
                 (reset! result :restored-segment))
               (catch Throwable e
                 (reset! result :transaction-failed!)
-                (log/error {:msg          "Restore transaction failed!"
-                            :db           source-database-name
-                            :error        (ex-message e)
-                            :error-data   (ex-data e)
-                            :t            t
-                            :tx-entry-t   (:t tx-entry)
-                            :tx-data-count (count (:data tx-entry))
+                (log/error {:msg            "Restore transaction failed!"
+                            :db             source-database-name
+                            :error          (ex-message e)
+                            :error-data     (ex-data e)
+                            :t              t
+                            :tx-entry-t     (:t tx-entry)
+                            :tx-data-count  (count (:data tx-entry))
                             :tx-data-sample (take 5 (:data tx-entry))
-                            :stack-trace  (take 15 (mapv str (.getStackTrace e)))})))))
+                            :stack-trace    (take 15 (mapv str (.getStackTrace e)))})))))
         (log/infof "Segment complete. ID cache stats: %s" (id-cache-stats cache-state))
         @result))))
 
